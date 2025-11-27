@@ -390,6 +390,32 @@ public class ConsumerConfig extends AbstractConfig {
             " to align with batch boundaries for optimization.";
     public static final String DEFAULT_SHARE_ACQUIRE_MODE = ShareAcquireMode.BATCH_OPTIMIZED.name();
 
+    /**
+     * <code>group.share.dlq.enabled</code>
+     */
+    public static final String SHARE_GROUP_DLQ_ENABLED_CONFIG = "group.share.dlq.enabled";
+    private static final String SHARE_GROUP_DLQ_ENABLED_DOC = "Enable Dead Letter Queue (DLQ) for share consumer. " +
+            "When enabled, records acknowledged with REJECT will be written to a DLQ topic before the acknowledgment is sent to the broker. " +
+            "The DLQ topic must be created beforehand or broker must have <code>group.share.dlq.auto.create.topics=true</code>.";
+    public static final boolean DEFAULT_SHARE_GROUP_DLQ_ENABLED = false;
+
+    /**
+     * <code>group.share.dlq.topic.name</code>
+     */
+    public static final String SHARE_GROUP_DLQ_TOPIC_NAME_CONFIG = "group.share.dlq.topic.name";
+    private static final String SHARE_GROUP_DLQ_TOPIC_NAME_DOC = "Custom DLQ topic name for rejected records. " +
+            "If not specified, the broker's configured prefix will be used with the format: {prefix}{sourceTopic}. " +
+            "For example, with broker prefix '__share_group_dlq_' and source topic 'orders', DLQ topic is '__share_group_dlq_orders'. " +
+            "Setting this overrides the broker's default naming for this consumer.";
+
+    /**
+     * <code>group.share.dlq.failure.reason</code>
+     */
+    public static final String SHARE_GROUP_DLQ_FAILURE_REASON_CONFIG = "group.share.dlq.failure.reason";
+    private static final String SHARE_GROUP_DLQ_FAILURE_REASON_DOC = "Optional failure reason to include in DLQ record headers. " +
+            "This allows consumers to provide context about why a record was rejected. The reason is written to the " +
+            "'__share.dlq.failure.reason' header in the DLQ record. Example values: 'ValidationError', 'ProcessingTimeout', 'InvalidFormat'.";
+
     private static final AtomicInteger CONSUMER_CLIENT_ID_SEQUENCE = new AtomicInteger(1);
 
     /**
@@ -701,6 +727,21 @@ public class ConsumerConfig extends AbstractConfig {
                                         new ShareAcquireMode.Validator(),
                                         Importance.MEDIUM,
                                         ConsumerConfig.SHARE_ACQUIRE_MODE_DOC)
+                                .define(ConsumerConfig.SHARE_GROUP_DLQ_ENABLED_CONFIG,
+                                        Type.BOOLEAN,
+                                        DEFAULT_SHARE_GROUP_DLQ_ENABLED,
+                                        Importance.MEDIUM,
+                                        ConsumerConfig.SHARE_GROUP_DLQ_ENABLED_DOC)
+                                .define(ConsumerConfig.SHARE_GROUP_DLQ_TOPIC_NAME_CONFIG,
+                                        Type.STRING,
+                                        null,
+                                        Importance.MEDIUM,
+                                        ConsumerConfig.SHARE_GROUP_DLQ_TOPIC_NAME_DOC)
+                                .define(ConsumerConfig.SHARE_GROUP_DLQ_FAILURE_REASON_CONFIG,
+                                        Type.STRING,
+                                        null,
+                                        Importance.LOW,
+                                        ConsumerConfig.SHARE_GROUP_DLQ_FAILURE_REASON_DOC)
                                 .define(CONFIG_PROVIDERS_CONFIG,
                                         ConfigDef.Type.LIST,
                                         List.of(),

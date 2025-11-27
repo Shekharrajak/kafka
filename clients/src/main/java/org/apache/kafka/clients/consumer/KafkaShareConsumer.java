@@ -22,6 +22,10 @@ import org.apache.kafka.clients.consumer.internals.ShareConsumerDelegateCreator;
 import org.apache.kafka.clients.consumer.internals.ShareConsumerMetadata;
 import org.apache.kafka.clients.consumer.internals.SubscriptionState;
 import org.apache.kafka.clients.consumer.internals.metrics.KafkaShareConsumerMetrics;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.Metric;
 import org.apache.kafka.common.MetricName;
@@ -33,18 +37,28 @@ import org.apache.kafka.common.errors.AuthorizationException;
 import org.apache.kafka.common.errors.InterruptException;
 import org.apache.kafka.common.errors.InvalidTopicException;
 import org.apache.kafka.common.errors.WakeupException;
+import org.apache.kafka.common.header.Header;
+import org.apache.kafka.common.header.Headers;
+import org.apache.kafka.common.header.internals.RecordHeader;
+import org.apache.kafka.common.header.internals.RecordHeaders;
 import org.apache.kafka.common.metrics.KafkaMetric;
 import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.serialization.Deserializer;
 import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.Time;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Collection;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 
 import static org.apache.kafka.common.utils.Utils.propsToMap;
 
@@ -302,9 +316,28 @@ import static org.apache.kafka.common.utils.Utils.propsToMap;
 @InterfaceStability.Evolving
 public class KafkaShareConsumer<K, V> implements ShareConsumer<K, V> {
 
+    private static final Logger log = LoggerFactory.getLogger(KafkaShareConsumer.class);
     private static final ShareConsumerDelegateCreator CREATOR = new ShareConsumerDelegateCreator();
 
+    // DLQ metadata header constants
+    private static final String DLQ_HEADER_ORIGINAL_TOPIC = "__share.dlq.original.topic";
+    private static final String DLQ_HEADER_ORIGINAL_PARTITION = "__share.dlq.original.partition";
+    private static final String DLQ_HEADER_ORIGINAL_OFFSET = "__share.dlq.original.offset";
+    private static final String DLQ_HEADER_GROUP_ID = "__share.dlq.group.id";
+    private static final String DLQ_HEADER_CONSUMER_ID = "__share.dlq.consumer.id";
+    private static final String DLQ_HEADER_REJECT_TIMESTAMP = "__share.dlq.reject.timestamp";
+    private static final String DLQ_HEADER_FAILURE_REASON = "__share.dlq.failure.reason";
+
     private final ShareConsumerDelegate<K, V> delegate;
+
+    // DLQ producer (lazy-initialized)
+    private KafkaProducer<K, V> dlqProducer = null;
+    private final Object dlqProducerLock = new Object();
+
+    // Store configuration for DLQ producer initialization
+    private final Map<String, Object> configs;
+    private final Deserializer<K> keyDeserializer;
+    private final Deserializer<V> valueDeserializer;
 
     /**
      * A consumer is instantiated by providing a set of key-value pairs as configuration. Valid configuration strings
@@ -372,12 +405,22 @@ public class KafkaShareConsumer<K, V> implements ShareConsumer<K, V> {
                               Deserializer<K> keyDeserializer,
                               Deserializer<V> valueDeserializer) {
         this(new ShareConsumerConfig(ShareConsumerConfig.appendDeserializerToConfig(configs, keyDeserializer, valueDeserializer)),
-                keyDeserializer, valueDeserializer);
+                keyDeserializer, valueDeserializer, configs);
     }
 
     KafkaShareConsumer(ShareConsumerConfig config,
                               Deserializer<K> keyDeserializer,
                               Deserializer<V> valueDeserializer) {
+        this(config, keyDeserializer, valueDeserializer, config.originals());
+    }
+
+    KafkaShareConsumer(ShareConsumerConfig config,
+                              Deserializer<K> keyDeserializer,
+                              Deserializer<V> valueDeserializer,
+                              Map<String, Object> configs) {
+        this.configs = configs;
+        this.keyDeserializer = keyDeserializer;
+        this.valueDeserializer = valueDeserializer;
         delegate = CREATOR.create(config, keyDeserializer, valueDeserializer);
     }
 
@@ -391,6 +434,9 @@ public class KafkaShareConsumer<K, V> implements ShareConsumer<K, V> {
                        final KafkaClient client,
                        final SubscriptionState subscriptions,
                        final ShareConsumerMetadata metadata) {
+        this.configs = config.originals();
+        this.keyDeserializer = keyDeserializer;
+        this.valueDeserializer = valueDeserializer;
         delegate = CREATOR.create(
                 logContext, clientId, groupId, config, keyDeserializer, valueDeserializer,
                 time, client, subscriptions, metadata);
@@ -684,6 +730,251 @@ public class KafkaShareConsumer<K, V> implements ShareConsumer<K, V> {
     }
 
     /**
+     * Writes a rejected record to the Dead Letter Queue before acknowledging REJECT.
+     *
+     * This method should be called BEFORE acknowledge(record, REJECT) to ensure
+     * the record is persisted to DLQ.
+     *
+     * @param record The record that failed processing
+     * @param failureReason Optional reason for rejection (e.g., exception message)
+     * @return CompletableFuture that completes when DLQ write finishes
+     *
+     * @throws IllegalStateException if DLQ is not configured
+     *
+     * <h3>Usage Example:</h3>
+     * <pre>
+     *     try {
+     *         processRecord(record);
+     *         consumer.acknowledge(record, AcknowledgeType.ACCEPT);
+     *     } catch (Exception e) {
+     *         // Write to DLQ first, then reject
+     *         consumer.writeToDLQ(record, e.getMessage())
+     *             .thenAccept(metadata -> {
+     *                 consumer.acknowledge(record, AcknowledgeType.REJECT);
+     *             });
+     *     }
+     * </pre>
+     */
+    public CompletableFuture<RecordMetadata> writeToDLQ(
+            ConsumerRecord<K, V> record,
+            String failureReason
+    ) {
+        // Check if DLQ is enabled
+        String dlqTopicName = getConfiguredDLQTopic(record.topic());
+        if (dlqTopicName == null) {
+            log.warn("DLQ topic not configured for source topic: {}. " +
+                    "Set 'group.share.dlq.topic.name' or use default naming convention.",
+                    record.topic());
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("DLQ not configured for topic: " + record.topic())
+            );
+        }
+
+        // Initialize DLQ producer if needed
+        ensureDLQProducerInitialized();
+
+        // Build DLQ record with metadata headers
+        ProducerRecord<K, V> dlqRecord = buildDLQRecord(record, dlqTopicName, failureReason);
+
+        // Send to DLQ asynchronously
+        CompletableFuture<RecordMetadata> future = new CompletableFuture<>();
+
+        dlqProducer.send(dlqRecord, (metadata, exception) -> {
+            if (exception != null) {
+                log.error("Failed to write record to DLQ topic {} (source: {}-{} offset {})",
+                        dlqTopicName, record.topic(), record.partition(), record.offset(), exception);
+                future.completeExceptionally(exception);
+            } else {
+                log.debug("Successfully wrote rejected record to DLQ {} partition {} offset {} " +
+                                "(source: {}-{} offset {})",
+                        metadata.topic(), metadata.partition(), metadata.offset(),
+                        record.topic(), record.partition(), record.offset());
+                future.complete(metadata);
+            }
+        });
+
+        return future;
+    }
+
+    /**
+     * Helper: Write to DLQ and acknowledge REJECT in one call.
+     *
+     * This is a convenience method that chains:
+     * 1. Write to DLQ
+     * 2. Acknowledge REJECT (only if DLQ write succeeds)
+     *
+     * @param record The record to reject
+     * @param failureReason Optional failure reason
+     *
+     * <h3>Usage Example:</h3>
+     * <pre>
+     *     for (ConsumerRecord&lt;String, String&gt; record : records) {
+     *         try {
+     *             processOrder(record.value());
+     *             consumer.acknowledge(record, AcknowledgeType.ACCEPT);
+     *         } catch (ValidationException e) {
+     *             // One-liner: write to DLQ and acknowledge REJECT
+     *             consumer.rejectAndSendToDLQ(record, e.getMessage());
+     *         }
+     *     }
+     * </pre>
+     */
+    public void rejectAndSendToDLQ(ConsumerRecord<K, V> record, String failureReason) {
+        writeToDLQ(record, failureReason)
+                .thenAccept(metadata -> {
+                    // DLQ write succeeded - now acknowledge REJECT
+                    acknowledge(record, AcknowledgeType.REJECT);
+                })
+                .exceptionally(throwable -> {
+                    // DLQ write failed - log but still acknowledge REJECT
+                    // (The record is still rejected even if DLQ fails)
+                    log.error("DLQ write failed for record {}-{} offset {}, " +
+                                    "but acknowledging REJECT anyway",
+                            record.topic(), record.partition(), record.offset(), throwable);
+                    acknowledge(record, AcknowledgeType.REJECT);
+                    return null;
+                });
+    }
+
+    /**
+     * Builds a DLQ ProducerRecord with original record data + metadata headers.
+     */
+    private ProducerRecord<K, V> buildDLQRecord(
+            ConsumerRecord<K, V> originalRecord,
+            String dlqTopicName,
+            String failureReason
+    ) {
+        // Copy original headers
+        Headers dlqHeaders = new RecordHeaders();
+        for (Header header : originalRecord.headers()) {
+            dlqHeaders.add(header);
+        }
+
+        // Add DLQ metadata headers
+        addDLQHeader(dlqHeaders, DLQ_HEADER_ORIGINAL_TOPIC, originalRecord.topic());
+        addDLQHeader(dlqHeaders, DLQ_HEADER_ORIGINAL_PARTITION, String.valueOf(originalRecord.partition()));
+        addDLQHeader(dlqHeaders, DLQ_HEADER_ORIGINAL_OFFSET, String.valueOf(originalRecord.offset()));
+        addDLQHeader(dlqHeaders, DLQ_HEADER_GROUP_ID, getGroupId());
+        addDLQHeader(dlqHeaders, DLQ_HEADER_CONSUMER_ID, clientId());
+        addDLQHeader(dlqHeaders, DLQ_HEADER_REJECT_TIMESTAMP, String.valueOf(System.currentTimeMillis()));
+
+        if (failureReason != null && !failureReason.isEmpty()) {
+            addDLQHeader(dlqHeaders, DLQ_HEADER_FAILURE_REASON, failureReason);
+        }
+
+        // Use original timestamp if available, otherwise current time
+        long timestamp = originalRecord.timestamp() != ConsumerRecord.NO_TIMESTAMP
+                ? originalRecord.timestamp()
+                : System.currentTimeMillis();
+
+        // Create DLQ record with original key/value and enriched headers
+        return new ProducerRecord<>(
+                dlqTopicName,
+                null, // partition - let producer choose based on key
+                timestamp,
+                originalRecord.key(),
+                originalRecord.value(),
+                dlqHeaders
+        );
+    }
+
+    /**
+     * Gets configured DLQ topic name for the source topic.
+     */
+    private String getConfiguredDLQTopic(String sourceTopic) {
+        // Check if custom DLQ topic configured
+        String customDLQTopic = (String) configs.get(ConsumerConfig.SHARE_GROUP_DLQ_TOPIC_NAME_CONFIG);
+        if (customDLQTopic != null && !customDLQTopic.isEmpty()) {
+            return customDLQTopic;
+        }
+
+        // Check if DLQ enabled
+        Boolean dlqEnabled = (Boolean) configs.get(ConsumerConfig.SHARE_GROUP_DLQ_ENABLED_CONFIG);
+        if (dlqEnabled == null || !dlqEnabled) {
+            return null; // DLQ not enabled
+        }
+
+        // Use default naming: __share_group_dlq_{sourceTopic}
+        return "__share_group_dlq_" + sourceTopic;
+    }
+
+    /**
+     * Initializes DLQ producer (lazy initialization).
+     */
+    private void ensureDLQProducerInitialized() {
+        if (dlqProducer != null) {
+            return;
+        }
+
+        synchronized (dlqProducerLock) {
+            if (dlqProducer != null) {
+                return;
+            }
+
+            // Create producer config from consumer config
+            Properties dlqProducerConfig = new Properties();
+            dlqProducerConfig.putAll(configs);
+
+            // Override with DLQ-specific settings
+            dlqProducerConfig.put(ProducerConfig.CLIENT_ID_CONFIG,
+                    "dlq-producer-" + getGroupId() + "-" + UUID.randomUUID());
+            dlqProducerConfig.put(ProducerConfig.ACKS_CONFIG, "all");
+            dlqProducerConfig.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true");
+            dlqProducerConfig.put(ProducerConfig.RETRIES_CONFIG, Integer.MAX_VALUE);
+
+            // Use same serializers as consumer's deserializers
+            dlqProducerConfig.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG,
+                    getSerializerClass(keyDeserializer));
+            dlqProducerConfig.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG,
+                    getSerializerClass(valueDeserializer));
+
+            dlqProducer = new KafkaProducer<>(dlqProducerConfig);
+
+            log.info("Initialized DLQ producer for share group: {}", getGroupId());
+        }
+    }
+
+    /**
+     * Gets the serializer class name for a given deserializer.
+     * Maps common deserializers to their corresponding serializers.
+     */
+    private String getSerializerClass(Deserializer<?> deserializer) {
+        if (deserializer == null) {
+            return ByteArraySerializer.class.getName();
+        }
+
+        String deserializerClass = deserializer.getClass().getName();
+
+        // Map common deserializers to serializers
+        if (deserializerClass.contains("StringDeserializer")) {
+            return "org.apache.kafka.common.serialization.StringSerializer";
+        } else if (deserializerClass.contains("ByteArrayDeserializer")) {
+            return ByteArraySerializer.class.getName();
+        } else if (deserializerClass.contains("IntegerDeserializer")) {
+            return "org.apache.kafka.common.serialization.IntegerSerializer";
+        } else if (deserializerClass.contains("LongDeserializer")) {
+            return "org.apache.kafka.common.serialization.LongSerializer";
+        } else if (deserializerClass.contains("DoubleDeserializer")) {
+            return "org.apache.kafka.common.serialization.DoubleSerializer";
+        } else if (deserializerClass.contains("FloatDeserializer")) {
+            return "org.apache.kafka.common.serialization.FloatSerializer";
+        } else if (deserializerClass.contains("ByteBufferDeserializer")) {
+            return "org.apache.kafka.common.serialization.ByteBufferSerializer";
+        }
+
+        // Default to ByteArraySerializer if no mapping found
+        log.warn("Unknown deserializer class: {}, defaulting to ByteArraySerializer", deserializerClass);
+        return ByteArraySerializer.class.getName();
+    }
+
+    /**
+     * Helper to add a DLQ header.
+     */
+    private void addDLQHeader(Headers headers, String key, String value) {
+        headers.add(new RecordHeader(key, value.getBytes(StandardCharsets.UTF_8)));
+    }
+
+    /**
      * Close the consumer, waiting for up to the default timeout of 30 seconds for any needed cleanup.
      * This will commit acknowledgements if possible within the default timeout.
      * See {@link #close(Duration)} for details. Note that {@link #wakeup()} cannot be used to interrupt close.
@@ -697,6 +988,8 @@ public class KafkaShareConsumer<K, V> implements ShareConsumer<K, V> {
      */
     @Override
     public void close() {
+        // Close DLQ producer first
+        closeDLQProducer();
         delegate.close();
     }
 
@@ -725,7 +1018,23 @@ public class KafkaShareConsumer<K, V> implements ShareConsumer<K, V> {
      */
     @Override
     public void close(Duration timeout) {
+        // Close DLQ producer first
+        closeDLQProducer();
         delegate.close(timeout);
+    }
+
+    /**
+     * Helper method to close DLQ producer.
+     */
+    private void closeDLQProducer() {
+        if (dlqProducer != null) {
+            try {
+                dlqProducer.close(Duration.ofSeconds(5));
+                log.info("Closed DLQ producer for share group: {}", getGroupId());
+            } catch (Exception e) {
+                log.error("Error closing DLQ producer", e);
+            }
+        }
     }
 
     /**
@@ -737,6 +1046,14 @@ public class KafkaShareConsumer<K, V> implements ShareConsumer<K, V> {
     @Override
     public void wakeup() {
         delegate.wakeup();
+    }
+
+    /**
+     * Gets the share group ID from consumer configuration.
+     */
+    private String getGroupId() {
+        Object groupId = configs.get(ConsumerConfig.GROUP_ID_CONFIG);
+        return groupId != null ? groupId.toString() : "unknown-group";
     }
 
     // Functions below are for testing only
