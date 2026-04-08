@@ -16,6 +16,7 @@
  */
 package org.apache.kafka.streams.state;
 
+import org.apache.kafka.common.header.Headers;
 import org.apache.kafka.common.utils.Bytes;
 
 /**
@@ -28,6 +29,14 @@ public interface VersionedBytesStore extends KeyValueStore<Bytes, byte[]>, Times
      * The analog of {@link VersionedKeyValueStore#put(Object, Object, long)}.
      */
     long put(Bytes key, byte[] value, long timestamp);
+
+    /**
+     * The analog of {@link VersionedKeyValueStore#put(Object, Object, long)} with headers.
+     * Default implementation discards headers for backward compatibility.
+     */
+    default long put(final Bytes key, final byte[] value, final long timestamp, final Headers headers) {
+        return put(key, value, timestamp);
+    }
 
     /**
      * The analog of {@link VersionedKeyValueStore#get(Object, long)}.
