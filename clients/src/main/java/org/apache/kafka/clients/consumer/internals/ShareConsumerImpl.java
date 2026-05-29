@@ -67,6 +67,7 @@ import org.apache.kafka.common.internals.ClusterResourceListeners;
 import org.apache.kafka.common.metrics.KafkaMetric;
 import org.apache.kafka.common.metrics.Metrics;
 import org.apache.kafka.common.metrics.MetricsReporter;
+import org.apache.kafka.common.metrics.Sensor;
 import org.apache.kafka.common.serialization.Deserializer;
 import org.apache.kafka.common.telemetry.internals.ClientTelemetryReporter;
 import org.apache.kafka.common.telemetry.internals.ClientTelemetryUtils;
@@ -202,6 +203,7 @@ public class ShareConsumerImpl<K, V> implements ShareConsumerDelegate<K, V> {
     private final SubscriptionState subscriptions;
     private final ShareConsumerMetadata metadata;
     private final Metrics metrics;
+    private final Sensor shareGroupMetadataFetchSensor;
     private final int requestTimeoutMs;
     private final int defaultApiTimeoutMs;
     private volatile boolean closed = false;
@@ -265,6 +267,7 @@ public class ShareConsumerImpl<K, V> implements ShareConsumerDelegate<K, V> {
             this.clientTelemetryReporter.ifPresent(reporters::add);
             this.metrics = createMetrics(config, time, reporters);
             this.asyncConsumerMetrics = new AsyncConsumerMetrics(metrics, CONSUMER_SHARE_METRIC_GROUP);
+            this.shareGroupMetadataFetchSensor = this.metrics.sensor("share-group-metadata-fetch");
 
             this.acknowledgementMode = initializeAcknowledgementMode(config);
             this.deserializers = new Deserializers<>(config, keyDeserializer, valueDeserializer, metrics);
@@ -376,6 +379,7 @@ public class ShareConsumerImpl<K, V> implements ShareConsumerDelegate<K, V> {
         this.log = logContext.logger(getClass());
         this.time = time;
         this.metrics = new Metrics(time);
+        this.shareGroupMetadataFetchSensor = this.metrics.sensor("share-group-metadata-fetch");
         this.clientTelemetryReporter = Optional.empty();
         this.deserializers = new Deserializers<>(config, keyDeserializer, valueDeserializer, metrics);
         this.currentFetch = ShareFetch.empty();
@@ -487,6 +491,7 @@ public class ShareConsumerImpl<K, V> implements ShareConsumerDelegate<K, V> {
         this.backgroundEventProcessor = new BackgroundEventProcessor();
         this.backgroundEventReaper = backgroundEventReaper;
         this.metrics = metrics;
+        this.shareGroupMetadataFetchSensor = this.metrics.sensor("share-group-metadata-fetch");
         this.metadata = metadata;
         this.requestTimeoutMs = requestTimeoutMs;
         this.defaultApiTimeoutMs = defaultApiTimeoutMs;
@@ -1120,6 +1125,7 @@ public class ShareConsumerImpl<K, V> implements ShareConsumerDelegate<K, V> {
     public ShareGroupMetadata shareGroupMetadata() {
         acquireAndEnsureOpen();
         try {
+            shareGroupMetadataFetchSensor.record();
             ShareGroupMetadataEvent event = new ShareGroupMetadataEvent(
                 calculateDeadlineMs(time.timer(defaultApiTimeoutMs)));
             applicationEventHandler.add(event);

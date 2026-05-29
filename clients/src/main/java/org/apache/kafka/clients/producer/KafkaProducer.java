@@ -276,6 +276,8 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
     private final Sender.SenderThread ioThread;
     private final Compression compression;
     private final Sensor errors;
+    private final Sensor shareAckTxnSend;
+    private final Sensor shareAckTxnSendError;
     private final Time time;
     private final Plugin<Serializer<K>> keySerializerPlugin;
     private final Plugin<Serializer<V>> valueSerializerPlugin;
@@ -471,6 +473,8 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
                 this.metadata.bootstrap(addresses);
             }
             this.errors = this.metrics.sensor("errors");
+            this.shareAckTxnSend = this.metrics.sensor("share-ack-txn-send");
+            this.shareAckTxnSendError = this.metrics.sensor("share-ack-txn-send-error");
             this.sender = newSender(logContext, kafkaClient, this.metadata);
             String ioThreadName = NETWORK_THREAD_PREFIX + " | " + clientId;
             this.ioThread = new Sender.SenderThread(ioThreadName, this.sender, true);
@@ -520,6 +524,8 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
         this.transactionManager = transactionManager;
         this.accumulator = accumulator;
         this.errors = this.metrics.sensor("errors");
+        this.shareAckTxnSend = this.metrics.sensor("share-ack-txn-send");
+        this.shareAckTxnSendError = this.metrics.sensor("share-ack-txn-send-error");
         this.metadata = metadata;
         this.sender = sender;
         this.ioThread = ioThread;
@@ -792,10 +798,16 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
         throwIfInPreparedState();
 
         if (!acknowledgements.isEmpty()) {
-            TransactionalRequestResult result =
-                transactionManager.sendShareAcknowledgementsToTransaction(acknowledgements, groupMetadata);
-            sender.wakeup();
-            result.await(maxBlockTimeMs, TimeUnit.MILLISECONDS, SEND_OFFSETS_TIMEOUT_MSG);
+            shareAckTxnSend.record();
+            try {
+                TransactionalRequestResult result =
+                    transactionManager.sendShareAcknowledgementsToTransaction(acknowledgements, groupMetadata);
+                sender.wakeup();
+                result.await(maxBlockTimeMs, TimeUnit.MILLISECONDS, SEND_OFFSETS_TIMEOUT_MSG);
+            } catch (Exception e) {
+                shareAckTxnSendError.record();
+                throw e;
+            }
         }
     }
 
