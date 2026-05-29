@@ -64,6 +64,8 @@ public class MockProducer<K, V> implements Producer<K, V> {
     private final Deque<Completion> completions;
     private final Map<TopicPartition, Long> offsets;
     private final List<Map<String, Map<TopicPartition, OffsetAndMetadata>>> consumerGroupOffsets;
+    private final List<Map<TopicIdPartition, List<AcknowledgementBatch>>> shareGroupAcks;
+    private Map<TopicIdPartition, List<AcknowledgementBatch>> uncommittedShareGroupAcks;
     private final Map<MetricName, Metric> mockMetrics;
     private final Serializer<K> keySerializer;
     private final Serializer<V> valueSerializer;
@@ -127,6 +129,8 @@ public class MockProducer<K, V> implements Producer<K, V> {
         this.sent = new ArrayList<>();
         this.uncommittedSends = new ArrayList<>();
         this.consumerGroupOffsets = new ArrayList<>();
+        this.shareGroupAcks = new ArrayList<>();
+        this.uncommittedShareGroupAcks = new HashMap<>();
         this.uncommittedConsumerGroupOffsets = new HashMap<>();
         this.completions = new ArrayDeque<>();
         this.mockMetrics = new HashMap<>();
@@ -220,6 +224,12 @@ public class MockProducer<K, V> implements Producer<K, V> {
         verifyNotFenced();
         verifyTransactionsInitialized();
         verifyTransactionInFlight();
+        acknowledgements.forEach((tip, batches) ->
+            uncommittedShareGroupAcks.merge(tip, batches, (a, b) -> {
+                List<AcknowledgementBatch> merged = new ArrayList<>(a);
+                merged.addAll(b);
+                return merged;
+            }));
     }
 
     @Override
@@ -250,9 +260,12 @@ public class MockProducer<K, V> implements Producer<K, V> {
         this.sent.addAll(this.uncommittedSends);
         if (!this.uncommittedConsumerGroupOffsets.isEmpty())
             this.consumerGroupOffsets.add(this.uncommittedConsumerGroupOffsets);
+        if (!this.uncommittedShareGroupAcks.isEmpty())
+            this.shareGroupAcks.add(this.uncommittedShareGroupAcks);
 
         this.uncommittedSends.clear();
         this.uncommittedConsumerGroupOffsets = new HashMap<>();
+        this.uncommittedShareGroupAcks = new HashMap<>();
         this.transactionCommitted = true;
         this.transactionAborted = false;
         this.transactionInFlight = false;
@@ -274,6 +287,7 @@ public class MockProducer<K, V> implements Producer<K, V> {
         flush();
         this.uncommittedSends.clear();
         this.uncommittedConsumerGroupOffsets.clear();
+        this.uncommittedShareGroupAcks.clear();
         this.transactionCommitted = false;
         this.transactionAborted = true;
         this.transactionInFlight = false;
@@ -589,6 +603,14 @@ public class MockProducer<K, V> implements Producer<K, V> {
      *
      * Get the list of committed consumer group offsets since the last call to {@link #clear()}
      */
+    public synchronized List<Map<TopicIdPartition, List<AcknowledgementBatch>>> shareGroupAcksHistory() {
+        return new ArrayList<>(this.shareGroupAcks);
+    }
+
+    public synchronized Map<TopicIdPartition, List<AcknowledgementBatch>> uncommittedShareGroupAcks() {
+        return new HashMap<>(this.uncommittedShareGroupAcks);
+    }
+
     public synchronized List<Map<String, Map<TopicPartition, OffsetAndMetadata>>> consumerGroupOffsetsHistory() {
         return new ArrayList<>(this.consumerGroupOffsets);
     }
@@ -612,6 +634,8 @@ public class MockProducer<K, V> implements Producer<K, V> {
         this.completions.clear();
         this.consumerGroupOffsets.clear();
         this.uncommittedConsumerGroupOffsets.clear();
+        this.shareGroupAcks.clear();
+        this.uncommittedShareGroupAcks.clear();
     }
 
     /**
