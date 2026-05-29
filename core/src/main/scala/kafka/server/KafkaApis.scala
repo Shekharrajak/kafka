@@ -3664,7 +3664,7 @@ class KafkaApis(val requestChannel: RequestChannel,
   def handleTxnShareAcknowledgeRequest(request: Request, requestLocal: RequestLocal): CompletableFuture[Unit] = {
     val txnShareAcknowledgeRequest = request.body(classOf[TxnShareAcknowledgeRequest])
 
-    if (!isShareGroupProtocolEnabled) {
+    if (!isTransactionalShareAcknowledgeEnabled) {
       requestHelper.sendMaybeThrottle(request,
         txnShareAcknowledgeRequest.getErrorResponse(AbstractResponse.DEFAULT_THROTTLE_TIME, Errors.UNSUPPORTED_VERSION.exception))
       return CompletableFuture.completedFuture[Unit](())
@@ -4354,6 +4354,10 @@ class KafkaApis(val requestChannel: RequestChannel,
 
   private def isShareGroupProtocolEnabled: Boolean = {
     shareVersion().supportsShareGroups
+  }
+
+  private def isTransactionalShareAcknowledgeEnabled: Boolean = {
+    shareVersion().supportsTransactionalShareAcknowledge
   }
 
   /**

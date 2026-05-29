@@ -133,7 +133,11 @@ public enum MetadataVersion {
 
     // IBP_4_4_IV0 enables dead-letter queue support for share groups (KIP-1191). When this version
     // is finalized, so will the DLQ support.
-    IBP_4_4_IV0(31, "4.4", "IV0", false);
+    IBP_4_4_IV0(31, "4.4", "IV0", false),
+
+    // IBP_4_5_IV0 enables transactional acknowledgments for share groups (KIP-1289). When this version
+    // is enabled, the broker will support the TxnShareAcknowledge RPC and TX_PENDING state machine transitions.
+    IBP_4_5_IV0(32, "4.5", "IV0", false);
 
 
     // NOTES when adding a new version:
