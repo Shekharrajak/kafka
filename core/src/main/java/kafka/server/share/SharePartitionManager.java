@@ -361,6 +361,7 @@ public class SharePartitionManager implements AutoCloseable {
         short producerEpoch,
         Map<TopicIdPartition, List<ShareAcknowledgementBatch>> acknowledgeTopics
     ) {
+        long startMs = time.hiResClockMs();
         log.trace("Txn acknowledge request for topicIdPartitions: {} groupId: {} producerId={}",
             acknowledgeTopics.keySet(), groupId, producerId);
         Map<TopicIdPartition, CompletableFuture<Throwable>> futures = new HashMap<>();
@@ -376,7 +377,8 @@ public class SharePartitionManager implements AutoCloseable {
                 .whenComplete((result, throwable) -> future.complete(throwable));
             futures.put(topicIdPartition, future);
         });
-        return mapAcknowledgementFutures(futures, Optional.empty());
+        return mapAcknowledgementFutures(futures, Optional.empty())
+            .whenComplete((r, t) -> shareGroupMetrics.txnShareAcknowledgeLatency(startMs));
     }
 
     public void applyTxnMarker(long producerId, short producerEpoch, TransactionResult result) {

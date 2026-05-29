@@ -28,6 +28,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 /**
@@ -39,6 +40,9 @@ public class ShareGroupMetrics implements AutoCloseable {
     private static final String PARTITION_LOAD_TIME_MS = "PartitionLoadTimeMs";
     private static final String TOPIC_PARTITIONS_FETCH_RATIO = "RequestTopicPartitionsFetchRatio";
     private static final String TOPIC_PARTITIONS_ACQUIRE_TIME_MS = "TopicPartitionsAcquireTimeMs";
+    private static final String TXN_PENDING_RECORDS_COUNT = "TxnPendingRecordsCount";
+    private static final String TXN_SHARE_ACKNOWLEDGE_LATENCY_MS = "TxnShareAcknowledgeRequestLatencyMs";
+    private static final String TXN_PENDING_LOCK_EXPIRED_COUNT = "TxnPendingLockExpiredCount";
     private static final String ACK_TYPE_TAG = "ackType";
 
     /**
@@ -57,6 +61,18 @@ public class ShareGroupMetrics implements AutoCloseable {
      * Metric for the time taken to acquire topic partitions for a group.
      */
     private final Map<String, Histogram> topicPartitionsAcquireTimeMs;
+    /**
+     * Current number of records in TX_PENDING state across all share partitions on this broker.
+     */
+    private final AtomicLong txnPendingRecordsCount;
+    /**
+     * Latency histogram for TxnShareAcknowledge RPC processing.
+     */
+    private final Histogram txnShareAcknowledgeLatencyMs;
+    /**
+     * Count of TX_PENDING records reverted via acquisition-lock timeout.
+     */
+    private final AtomicLong txnPendingLockExpiredCount;
 
     private final KafkaMetricsGroup metricsGroup;
     private final Time time;
@@ -78,6 +94,11 @@ public class ShareGroupMetrics implements AutoCloseable {
         this.partitionLoadTimeMs = metricsGroup.newHistogram(PARTITION_LOAD_TIME_MS);
         this.topicPartitionsFetchRatio = new ConcurrentHashMap<>();
         this.topicPartitionsAcquireTimeMs = new ConcurrentHashMap<>();
+        this.txnPendingRecordsCount = new AtomicLong(0);
+        metricsGroup.newGauge(TXN_PENDING_RECORDS_COUNT, () -> txnPendingRecordsCount.get());
+        this.txnShareAcknowledgeLatencyMs = metricsGroup.newHistogram(TXN_SHARE_ACKNOWLEDGE_LATENCY_MS);
+        this.txnPendingLockExpiredCount = new AtomicLong(0);
+        metricsGroup.newGauge(TXN_PENDING_LOCK_EXPIRED_COUNT, () -> txnPendingLockExpiredCount.get());
     }
 
     public void recordAcknowledgement(byte ackType) {
@@ -127,6 +148,32 @@ public class ShareGroupMetrics implements AutoCloseable {
         return topicPartitionsAcquireTimeMs.get(groupId);
     }
 
+    public void txnPendingRecordsIncrement() {
+        txnPendingRecordsCount.incrementAndGet();
+    }
+
+    public void txnPendingRecordsDecrement() {
+        txnPendingRecordsCount.decrementAndGet();
+    }
+
+    public void txnShareAcknowledgeLatency(long startMs) {
+        txnShareAcknowledgeLatencyMs.update(time.hiResClockMs() - startMs);
+    }
+
+    public void txnPendingLockExpired() {
+        txnPendingLockExpiredCount.incrementAndGet();
+    }
+
+    // Visible for testing
+    public long txnPendingRecordsCount() {
+        return txnPendingRecordsCount.get();
+    }
+
+    // Visible for testing
+    public long txnPendingLockExpiredCount() {
+        return txnPendingLockExpiredCount.get();
+    }
+
     @Override
     public void close() throws Exception {
         Arrays.stream(AcknowledgeType.values()).forEach(
@@ -134,6 +181,11 @@ public class ShareGroupMetrics implements AutoCloseable {
         metricsGroup.removeMetric(PARTITION_LOAD_TIME_MS);
         topicPartitionsFetchRatio.forEach((k, v) -> metricsGroup.removeMetric(TOPIC_PARTITIONS_FETCH_RATIO, Map.of("group", k)));
         topicPartitionsAcquireTimeMs.forEach((k, v) -> metricsGroup.removeMetric(TOPIC_PARTITIONS_ACQUIRE_TIME_MS, Map.of("group", k)));
+        metricsGroup.removeMetric(TXN_PENDING_RECORDS_COUNT);
+        metricsGroup.removeMetric(TXN_SHARE_ACKNOWLEDGE_LATENCY_MS);
+        metricsGroup.removeMetric(TXN_PENDING_LOCK_EXPIRED_COUNT);
+        txnPendingRecordsCount.set(0);
+        txnPendingLockExpiredCount.set(0);
     }
 
     private static String capitalize(String string) {
