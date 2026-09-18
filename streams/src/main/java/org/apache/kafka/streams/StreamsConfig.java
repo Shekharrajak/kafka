@@ -1992,6 +1992,27 @@ public class StreamsConfig extends AbstractConfig {
         return consumerProps;
     }
 
+    public Map<String, Object> getShareConsumerConfigs(final String groupId, final String clientId) {
+        final Map<String, Object> consumerProps = getCommonConsumerConfigs();
+        final Map<String, Object> shareConsumerProps = originalsWithPrefix(CONSUMER_PREFIX);
+        shareConsumerProps.remove(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG);
+        shareConsumerProps.remove(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG);
+        shareConsumerProps.remove(ConsumerConfig.GROUP_INSTANCE_ID_CONFIG);
+        shareConsumerProps.remove(ConsumerConfig.ISOLATION_LEVEL_CONFIG);
+        shareConsumerProps.remove(ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG);
+        shareConsumerProps.remove(ConsumerConfig.INTERCEPTOR_CLASSES_CONFIG);
+        shareConsumerProps.remove(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG);
+        shareConsumerProps.remove(ConsumerConfig.HEARTBEAT_INTERVAL_MS_CONFIG);
+        shareConsumerProps.remove(ConsumerConfig.GROUP_PROTOCOL_CONFIG);
+        shareConsumerProps.remove(ConsumerConfig.GROUP_REMOTE_ASSIGNOR_CONFIG);
+        consumerProps.putAll(shareConsumerProps);
+        consumerProps.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
+        consumerProps.put(CommonClientConfigs.CLIENT_ID_CONFIG, clientId);
+        consumerProps.put(ConsumerConfig.SHARE_ACKNOWLEDGEMENT_MODE_CONFIG, "explicit");
+        enforceSynchronousBootstrapResolution(consumerProps, "share consumer");
+        return consumerProps;
+    }
+
     /**
      * Get the configs for the {@link KafkaConsumer restore-consumer}.
      * Properties using the prefix {@link #RESTORE_CONSUMER_PREFIX} will be used in favor over

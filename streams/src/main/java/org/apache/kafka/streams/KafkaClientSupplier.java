@@ -18,6 +18,8 @@ package org.apache.kafka.streams;
 
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.KafkaShareConsumer;
+import org.apache.kafka.clients.consumer.ShareConsumer;
 import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.common.annotation.InterfaceAudience;
 import org.apache.kafka.streams.kstream.GlobalKTable;
@@ -59,6 +61,16 @@ public interface KafkaClientSupplier {
      * @return an instance of Kafka consumer
      */
     Consumer<byte[], byte[]> getConsumer(final Map<String, Object> config);
+
+    /**
+     * Create a share consumer used to read declared share sources.
+     *
+     * @param config share consumer configuration supplied by Kafka Streams
+     * @return a share consumer
+     */
+    default ShareConsumer<byte[], byte[]> getShareConsumer(final Map<String, Object> config) {
+        return new KafkaShareConsumer<>(config);
+    }
 
     /**
      * Create a {@link Consumer} which is used to read records to restore {@link StateStore}s.
