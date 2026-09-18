@@ -246,7 +246,7 @@ public class TaskManagerTest {
     }
 
     @Test
-    public void shouldRouteShareIngressRecordsToThePhysicalPartitionOwner() {
+    public void shouldRouteShareIngressRecordsToTheAssignmentOwner() {
         final TasksRegistry tasks = mock(TasksRegistry.class);
         final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
         final TopicPartition ingressPartition = new TopicPartition("application-topic1-share-ingress", 0);
@@ -266,11 +266,37 @@ public class TaskManagerTest {
             Map.of(ingressPartition, List.of(ingressRecord)),
             Map.of()
         );
-        when(tasks.activeInitializedTasksForInputPartition(ingressPartition)).thenReturn(activeTask);
+        when(tasks.activeInitializedTaskIds()).thenReturn(Set.of(taskId00));
+        when(tasks.initializedTask(taskId00)).thenReturn(activeTask);
 
         taskManager.addShareIngressRecordsToTasks(records, assignment);
 
         verify(activeTask).addShareIngressRecords(ingressPartition, List.of(ingressRecord), assignment);
+    }
+
+    @Test
+    public void shouldRejectShareIngressRecordsWhenTheTargetTaskIsNotActive() {
+        final TasksRegistry tasks = mock(TasksRegistry.class);
+        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+        final TopicPartition ingressPartition = new TopicPartition("application-topic1-share-ingress", 0);
+        final ShareIngressAssignment assignment = new ShareIngressAssignment(
+            "application",
+            Map.of(taskId00, Set.of(t1p0))
+        );
+        final ConsumerRecords<byte[], byte[]> records = new ConsumerRecords<>(
+            Map.of(ingressPartition, List.of(new ConsumerRecord<>(
+                ingressPartition.topic(),
+                ingressPartition.partition(),
+                9L,
+                null,
+                null
+            ))),
+            Map.of()
+        );
+        when(tasks.activeInitializedTaskIds()).thenReturn(Set.of());
+
+        assertThrows(IllegalStateException.class,
+            () -> taskManager.addShareIngressRecordsToTasks(records, assignment));
     }
 
     @Test

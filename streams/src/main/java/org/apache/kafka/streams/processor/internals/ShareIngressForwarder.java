@@ -18,6 +18,7 @@ package org.apache.kafka.streams.processor.internals;
 
 import org.apache.kafka.clients.consumer.AcknowledgeType;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ShareAcknowledgements;
 import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.KafkaException;
@@ -33,9 +34,16 @@ import java.util.Optional;
 
 final class ShareIngressForwarder {
     private final Producer<byte[], byte[]> producer;
+    private final StreamsProducer streamsProducer;
 
     ShareIngressForwarder(final Producer<byte[], byte[]> producer) {
         this.producer = Objects.requireNonNull(producer, "producer cannot be null");
+        streamsProducer = null;
+    }
+
+    ShareIngressForwarder(final StreamsProducer streamsProducer) {
+        this.streamsProducer = Objects.requireNonNull(streamsProducer, "streamsProducer cannot be null");
+        producer = null;
     }
 
     void forward(final ShareSource.PollResult batch, final ShareIngressAssignment assignment) {
@@ -44,10 +52,12 @@ final class ShareIngressForwarder {
         final List<ForwardedRecord> forwardedRecords = prepare(batch, assignment);
         write(forwardedRecords);
         acknowledge(batch, forwardedRecords);
-        producer.sendShareAcknowledgementsToTransaction(
-            batch.acknowledgementOwner().acknowledgementsForTransaction(),
-            batch.identity().shareGroupMetadata()
-        );
+        final ShareAcknowledgements acknowledgements = batch.acknowledgementOwner().acknowledgementsForTransaction();
+        if (streamsProducer != null) {
+            streamsProducer.sendShareAcknowledgementsToTransaction(acknowledgements, batch.identity().shareGroupMetadata());
+        } else {
+            producer.sendShareAcknowledgementsToTransaction(acknowledgements, batch.identity().shareGroupMetadata());
+        }
     }
 
     void forwardAtLeastOnce(final ShareSource.PollResult batch, final ShareIngressAssignment assignment) {
@@ -74,12 +84,17 @@ final class ShareIngressForwarder {
 
     private void write(final List<ForwardedRecord> forwardedRecords) {
         for (final ForwardedRecord forwardedRecord : forwardedRecords) {
-            producer.send(new ProducerRecord<>(
+            final ProducerRecord<byte[], byte[]> ingressRecord = new ProducerRecord<>(
                 forwardedRecord.ingressPartition.topic(),
                 forwardedRecord.ingressPartition.partition(),
                 null,
                 ShareIngressRecordSerde.serialize(new ShareIngressRecord(forwardedRecord.targetTaskId, forwardedRecord.sourceRecord))
-            ));
+            );
+            if (streamsProducer != null) {
+                streamsProducer.send(ingressRecord, null);
+            } else {
+                producer.send(ingressRecord);
+            }
         }
     }
 

@@ -73,6 +73,27 @@ class ShareIngressForwarderTest {
         ordered.verify(producer).sendShareAcknowledgementsToTransaction(same(acknowledgements), same(metadata));
     }
 
+    @Test
+    void shouldUseStreamsProducerForTransactionalIngress() {
+        final StreamsProducer producer = mock(StreamsProducer.class);
+        final ShareConsumer<byte[], byte[]> consumer = mock(ShareConsumer.class);
+        final ShareGroupMetadata metadata = new ShareGroupMetadata("share-group", "member", 3);
+        final ShareAcknowledgements acknowledgements = ShareAcknowledgements.empty();
+        final ConsumerRecord<byte[], byte[]> record = new ConsumerRecord<>("source", 1, 2L, new byte[] {1}, new byte[] {2});
+        final ShareSource.PollResult batch = poll(consumer, metadata, acknowledgements, record);
+        final ShareIngressAssignment assignment = new ShareIngressAssignment(
+            "application",
+            Map.of(new TaskId(0, 1), Set.of(new TopicPartition("source", 1)))
+        );
+
+        new ShareIngressForwarder(producer).forward(batch, assignment);
+
+        final InOrder ordered = inOrder(producer, consumer);
+        ordered.verify(producer).send(any(), any());
+        ordered.verify(consumer).acknowledge(record, AcknowledgeType.ACCEPT);
+        ordered.verify(producer).sendShareAcknowledgementsToTransaction(same(acknowledgements), same(metadata));
+    }
+
     @SuppressWarnings("unchecked")
     @Test
     void shouldNotStageShareAcknowledgementsWhenIngressWriteFails() {

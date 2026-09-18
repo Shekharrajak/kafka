@@ -1890,7 +1890,11 @@ public class TaskManager {
     void addShareIngressRecordsToTasks(final ConsumerRecords<byte[], byte[]> records,
                                        final ShareIngressAssignment assignment) {
         for (final TopicPartition partition : records.partitions()) {
-            final Task activeTask = getActiveTask(partition);
+            final TaskId taskId = assignment.targetTaskForIngress(partition);
+            if (!tasks.activeInitializedTaskIds().contains(taskId)) {
+                throw new IllegalStateException("No active task owns ingress partition " + partition);
+            }
+            final Task activeTask = tasks.initializedTask(taskId);
             if (!(activeTask instanceof StreamTask)) {
                 throw new IllegalStateException("Active task for ingress partition " + partition + " is not a stream task");
             }
