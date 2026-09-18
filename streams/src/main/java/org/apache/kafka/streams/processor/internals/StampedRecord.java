@@ -25,11 +25,15 @@ public class StampedRecord extends Stamped<ConsumerRecord<?, ?>> {
 
     private final byte[] rawKey;
     private final byte[] rawValue;
+    private final long inputOffset;
+    private final Optional<Integer> inputLeaderEpoch;
 
     public StampedRecord(final ConsumerRecord<?, ?> record, final long timestamp) {
         super(record, timestamp);
         this.rawKey = null;
         this.rawValue = null;
+        this.inputOffset = record.offset();
+        this.inputLeaderEpoch = record.leaderEpoch();
     }
 
     public StampedRecord(final ConsumerRecord<?, ?> record,
@@ -39,6 +43,21 @@ public class StampedRecord extends Stamped<ConsumerRecord<?, ?>> {
         super(record, timestamp);
         this.rawKey = rawKey;
         this.rawValue = rawValue;
+        this.inputOffset = record.offset();
+        this.inputLeaderEpoch = record.leaderEpoch();
+    }
+
+    public StampedRecord(final ConsumerRecord<?, ?> record,
+                         final long timestamp,
+                         final byte[] rawKey,
+                         final byte[] rawValue,
+                         final long inputOffset,
+                         final Optional<Integer> inputLeaderEpoch) {
+        super(record, timestamp);
+        this.rawKey = rawKey;
+        this.rawValue = rawValue;
+        this.inputOffset = inputOffset;
+        this.inputLeaderEpoch = inputLeaderEpoch;
     }
 
     public String topic() {
@@ -63,6 +82,14 @@ public class StampedRecord extends Stamped<ConsumerRecord<?, ?>> {
 
     public Optional<Integer> leaderEpoch() {
         return value.leaderEpoch();
+    }
+
+    public long inputOffset() {
+        return inputOffset;
+    }
+
+    public Optional<Integer> inputLeaderEpoch() {
+        return inputLeaderEpoch;
     }
 
     public Headers headers() {

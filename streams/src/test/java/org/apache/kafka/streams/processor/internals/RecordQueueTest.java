@@ -37,6 +37,7 @@ import org.apache.kafka.streams.errors.LogAndFailExceptionHandler;
 import org.apache.kafka.streams.errors.StreamsException;
 import org.apache.kafka.streams.processor.FailOnInvalidTimestamp;
 import org.apache.kafka.streams.processor.LogAndSkipOnInvalidTimestamp;
+import org.apache.kafka.streams.processor.TaskId;
 import org.apache.kafka.streams.processor.TimestampExtractor;
 import org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl;
 import org.apache.kafka.streams.state.StateSerdes;
@@ -52,7 +53,9 @@ import org.junit.jupiter.api.Test;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import static org.apache.kafka.streams.processor.internals.ClientUtils.consumerRecordSizeInBytes;
 import static org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl.TOPIC_LEVEL_GROUP;
@@ -277,6 +280,126 @@ public class RecordQueueTest {
         assertEquals(4L, queue.headRecordTimestamp());
         assertEquals(4L, queue.headRecordOffset().longValue());
         assertEquals(Optional.of(2), queue.headRecordLeaderEpoch());
+    }
+
+    @Test
+    public void shouldProcessOriginalContextAndTrackIngressProgress() {
+        final TaskId taskId = new TaskId(0, 1);
+        final TopicPartition sourcePartition = new TopicPartition("topic", 1);
+        final TopicPartition ingressPartition = new TopicPartition("application-topic-share-ingress", 1);
+        final RecordQueue ingressQueue = new RecordQueue(
+            ingressPartition,
+            mockSourceNodeWithMetrics,
+            timestampExtractor,
+            new LogAndFailExceptionHandler(),
+            context,
+            new LogContext()
+        );
+        final ShareIngressAssignment assignment = new ShareIngressAssignment(
+            "application",
+            Map.of(taskId, Set.of(sourcePartition))
+        );
+        final ShareIngressRecord sourceRecord = new ShareIngressRecord(
+            taskId,
+            new ConsumerRecord<>(
+                "topic",
+                1,
+                42L,
+                10L,
+                TimestampType.CREATE_TIME,
+                recordKey.length,
+                recordValue.length,
+                recordKey,
+                recordValue,
+                new RecordHeaders(),
+                Optional.of(3)
+            )
+        );
+        final ConsumerRecord<byte[], byte[]> ingressRecord = new ConsumerRecord<>(
+            ingressPartition.topic(),
+            ingressPartition.partition(),
+            9L,
+            20L,
+            TimestampType.CREATE_TIME,
+            -1,
+            0,
+            null,
+            ShareIngressRecordSerde.serialize(sourceRecord),
+            new RecordHeaders(),
+            Optional.of(7)
+        );
+
+        ingressQueue.addShareIngressRecords(taskId, List.of(ingressRecord), assignment);
+
+        assertEquals(9L, ingressQueue.headRecordOffset().longValue());
+        assertEquals(Optional.of(7), ingressQueue.headRecordLeaderEpoch());
+        final StampedRecord record = ingressQueue.poll(0L);
+        assertEquals("topic", record.topic());
+        assertEquals(1, record.partition());
+        assertEquals(42L, record.offset());
+        assertEquals(42L, record.timestamp);
+        assertEquals(1, record.key());
+        assertEquals(10, record.value());
+        assertEquals(9L, record.inputOffset());
+        assertEquals(Optional.of(7), record.inputLeaderEpoch());
+    }
+
+    @Test
+    public void shouldNotAddIngressBatchWhenAnyRecordDoesNotMatchItsPhysicalPartition() {
+        final TaskId taskId = new TaskId(0, 1);
+        final TopicPartition sourcePartition = new TopicPartition("topic", 1);
+        final TopicPartition ingressPartition = new TopicPartition("application-topic-share-ingress", 1);
+        final RecordQueue ingressQueue = new RecordQueue(
+            ingressPartition,
+            mockSourceNodeWithMetrics,
+            timestampExtractor,
+            new LogAndFailExceptionHandler(),
+            context,
+            new LogContext()
+        );
+        final ShareIngressAssignment assignment = new ShareIngressAssignment(
+            "application",
+            Map.of(taskId, Set.of(sourcePartition))
+        );
+        final ConsumerRecord<byte[], byte[]> validIngressRecord = new ConsumerRecord<>(
+            ingressPartition.topic(),
+            ingressPartition.partition(),
+            9L,
+            20L,
+            TimestampType.CREATE_TIME,
+            -1,
+            0,
+            null,
+            ShareIngressRecordSerde.serialize(new ShareIngressRecord(taskId, new ConsumerRecord<>(
+                "topic", 1, 42L, 10L, TimestampType.CREATE_TIME, recordKey.length, recordValue.length,
+                recordKey, recordValue, new RecordHeaders(), Optional.of(3)
+            ))),
+            new RecordHeaders(),
+            Optional.of(7)
+        );
+        final ConsumerRecord<byte[], byte[]> invalidIngressRecord = new ConsumerRecord<>(
+            ingressPartition.topic(),
+            ingressPartition.partition(),
+            10L,
+            20L,
+            TimestampType.CREATE_TIME,
+            -1,
+            0,
+            null,
+            ShareIngressRecordSerde.serialize(new ShareIngressRecord(taskId, new ConsumerRecord<>(
+                "other-topic", 1, 43L, 10L, TimestampType.CREATE_TIME, recordKey.length, recordValue.length,
+                recordKey, recordValue, new RecordHeaders(), Optional.of(3)
+            ))),
+            new RecordHeaders(),
+            Optional.of(7)
+        );
+
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> ingressQueue.addShareIngressRecords(taskId, List.of(validIngressRecord, invalidIngressRecord), assignment)
+        );
+
+        assertTrue(ingressQueue.isEmpty());
     }
 
     @Test

@@ -19,6 +19,7 @@ package org.apache.kafka.streams.processor.internals;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * This class represents a version of a {@link StampedRecord} that failed to deserialize. We need
@@ -29,6 +30,12 @@ public class CorruptedRecord extends StampedRecord {
 
     CorruptedRecord(final ConsumerRecord<byte[], byte[]> rawRecord) {
         super(rawRecord, ConsumerRecord.NO_TIMESTAMP);
+    }
+
+    CorruptedRecord(final ConsumerRecord<byte[], byte[]> rawRecord,
+                    final long inputOffset,
+                    final Optional<Integer> inputLeaderEpoch) {
+        super(rawRecord, ConsumerRecord.NO_TIMESTAMP, null, null, inputOffset, inputLeaderEpoch);
     }
 
     @Override

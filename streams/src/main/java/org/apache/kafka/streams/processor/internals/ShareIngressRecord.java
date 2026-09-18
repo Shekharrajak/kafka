@@ -20,6 +20,7 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.header.Header;
 import org.apache.kafka.common.header.Headers;
 import org.apache.kafka.common.header.internals.RecordHeaders;
+import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.streams.processor.TaskId;
 
 import java.util.Arrays;
@@ -88,6 +89,24 @@ final class ShareIngressRecord {
 
     ProcessorRecordContext recordContext() {
         return new ProcessorRecordContext(timestamp, offset, partition, topic, headers(), key(), value());
+    }
+
+    ConsumerRecord<byte[], byte[]> sourceConsumerRecord() {
+        final byte[] sourceKey = key();
+        final byte[] sourceValue = value();
+        return new ConsumerRecord<>(
+            topic,
+            partition,
+            offset,
+            timestamp,
+            TimestampType.CREATE_TIME,
+            sourceKey == null ? -1 : sourceKey.length,
+            sourceValue == null ? -1 : sourceValue.length,
+            sourceKey,
+            sourceValue,
+            headers(),
+            leaderEpoch
+        );
     }
 
     private static byte[] copyBytes(final byte[] bytes) {
