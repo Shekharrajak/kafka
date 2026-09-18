@@ -21,13 +21,37 @@ import org.apache.kafka.streams.processor.TaskId;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import static org.apache.kafka.test.StreamsTestUtils.TaskBuilder.statelessTask;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class ShareIngressAssignmentTest {
+    @Test
+    void shouldDeriveIngressOwnershipFromActiveTaskInputs() {
+        final TaskId firstTaskId = new TaskId(0, 0);
+        final TaskId secondTaskId = new TaskId(0, 1);
+        final StreamTask firstTask = statelessTask(firstTaskId)
+            .withInputPartitions(Set.of(new TopicPartition("share-source", 0), new TopicPartition("regular-source", 0)))
+            .build();
+        final StreamTask secondTask = statelessTask(secondTaskId)
+            .withInputPartitions(Set.of(new TopicPartition("share-source", 1)))
+            .build();
+
+        final ShareIngressAssignment assignment = ShareIngressAssignment.fromActiveTasks(
+            "application",
+            List.of(firstTask, secondTask),
+            Set.of("share-source")
+        );
+
+        assertEquals(firstTaskId, assignment.targetTask(new TopicPartition("share-source", 0)));
+        assertEquals(secondTaskId, assignment.targetTask(new TopicPartition("share-source", 1)));
+        assertThrows(IllegalArgumentException.class,
+            () -> assignment.targetTask(new TopicPartition("regular-source", 0)));
+    }
     @Test
     void shouldRouteEachSourcePartitionToItsOwningTaskAndIngressPartition() {
         final ShareIngressAssignment assignment = new ShareIngressAssignment(

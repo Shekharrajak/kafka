@@ -19,6 +19,7 @@ package org.apache.kafka.streams.processor.internals;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.streams.processor.TaskId;
 
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
@@ -60,6 +61,26 @@ final class ShareIngressAssignment {
             mutableIngressPartitionsByTask.computeIfAbsent(targetTaskId, ignored -> new HashSet<>()).add(ingressPartition);
         }
         ingressPartitionsByTask = immutablePartitionSets(mutableIngressPartitionsByTask);
+    }
+
+    static ShareIngressAssignment fromActiveTasks(final String applicationId,
+                                                   final Collection<StreamTask> activeTasks,
+                                                   final Set<String> shareSourceTopics) {
+        Objects.requireNonNull(activeTasks, "activeTasks cannot be null");
+        Objects.requireNonNull(shareSourceTopics, "shareSourceTopics cannot be null");
+        final Map<TaskId, Set<TopicPartition>> partitionsForTask = new HashMap<>();
+        for (final StreamTask task : activeTasks) {
+            final Set<TopicPartition> shareSourcePartitions = new HashSet<>();
+            for (final TopicPartition partition : task.inputPartitions()) {
+                if (shareSourceTopics.contains(partition.topic())) {
+                    shareSourcePartitions.add(partition);
+                }
+            }
+            if (!shareSourcePartitions.isEmpty()) {
+                partitionsForTask.put(task.id(), shareSourcePartitions);
+            }
+        }
+        return new ShareIngressAssignment(applicationId, partitionsForTask);
     }
 
     TaskId targetTask(final TopicPartition sourcePartition) {
