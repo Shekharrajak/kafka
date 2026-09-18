@@ -19,6 +19,8 @@ package org.apache.kafka.streams.processor.internals;
 import org.apache.kafka.clients.consumer.CommitFailedException;
 import org.apache.kafka.clients.consumer.ConsumerGroupMetadata;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.clients.consumer.ShareAcknowledgements;
+import org.apache.kafka.clients.consumer.ShareGroupMetadata;
 import org.apache.kafka.clients.producer.Callback;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.Producer;
@@ -262,6 +264,42 @@ public class StreamsProducer {
             );
         }
 
+        commitTransactionOrThrow();
+    }
+
+    void sendShareAcknowledgementsToTransaction(final ShareAcknowledgements acknowledgements,
+                                                final ShareGroupMetadata shareGroupMetadata) {
+        if (!eosEnabled()) {
+            throw new IllegalStateException(formatException("Exactly-once is not enabled"));
+        }
+        maybeBeginTransaction();
+        try {
+            producer.sendShareAcknowledgementsToTransaction(acknowledgements, shareGroupMetadata);
+        } catch (final ProducerFencedException | InvalidProducerEpochException | CommitFailedException | InvalidPidMappingException error) {
+            throw new TaskMigratedException(
+                formatException("Producer got fenced trying to add share acknowledgements to a transaction"),
+                error
+            );
+        } catch (final TimeoutException timeoutException) {
+            throw timeoutException;
+        } catch (final KafkaException error) {
+            throw new StreamsException(
+                formatException("Error encountered trying to stage share acknowledgements to a transaction"),
+                error
+            );
+        }
+    }
+
+    void commitTransaction() {
+        if (!eosEnabled()) {
+            throw new IllegalStateException(formatException("Exactly-once is not enabled"));
+        }
+        if (transactionInFlight) {
+            commitTransactionOrThrow();
+        }
+    }
+
+    private void commitTransactionOrThrow() {
         try {
             producer.commitTransaction();
             transactionInFlight = false;
@@ -271,7 +309,6 @@ public class StreamsProducer {
                 error
             );
         } catch (final TimeoutException timeoutException) {
-            // re-throw to trigger `task.timeout.ms`
             throw timeoutException;
         } catch (final KafkaException error) {
             throw new StreamsException(

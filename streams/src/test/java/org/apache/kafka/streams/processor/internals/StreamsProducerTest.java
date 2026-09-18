@@ -18,6 +18,8 @@ package org.apache.kafka.streams.processor.internals;
 
 import org.apache.kafka.clients.consumer.ConsumerGroupMetadata;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.clients.consumer.ShareAcknowledgements;
+import org.apache.kafka.clients.consumer.ShareGroupMetadata;
 import org.apache.kafka.clients.producer.MockProducer;
 import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerRecord;
@@ -43,6 +45,7 @@ import org.apache.kafka.streams.errors.TaskMigratedException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InOrder;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.mockito.junit.jupiter.MockitoSettings;
 import org.mockito.quality.Strictness;
@@ -208,6 +211,52 @@ public class StreamsProducerTest {
     public void shouldForwardCallToClose() {
         streamsProducerWithMock.close();
         verify(mockedProducer).close();
+    }
+
+    @Test
+    public void shouldStageShareAcknowledgementsAndCommitWithoutConsumerOffsets() {
+        final ShareAcknowledgements acknowledgements = ShareAcknowledgements.empty();
+        final ShareGroupMetadata metadata = new ShareGroupMetadata("share-group", "member", 3);
+
+        eosStreamsProducerWithMock.sendShareAcknowledgementsToTransaction(acknowledgements, metadata);
+        eosStreamsProducerWithMock.commitTransaction();
+
+        final InOrder ordered = org.mockito.Mockito.inOrder(mockedProducer);
+        ordered.verify(mockedProducer).beginTransaction();
+        ordered.verify(mockedProducer).sendShareAcknowledgementsToTransaction(acknowledgements, metadata);
+        ordered.verify(mockedProducer).commitTransaction();
+        assertThat(eosStreamsProducerWithMock.transactionInFlight(), is(false));
+    }
+
+    @Test
+    public void shouldFailToStageShareAcknowledgementsWhenEosIsDisabled() {
+        assertThrows(
+            IllegalStateException.class,
+            () -> streamsProducerWithMock.sendShareAcknowledgementsToTransaction(
+                ShareAcknowledgements.empty(),
+                new ShareGroupMetadata("share-group", "member", 3)
+            )
+        );
+    }
+
+    @Test
+    public void shouldTranslateProducerFenceWhileStagingShareAcknowledgements() {
+        final ProducerFencedException fence = new ProducerFencedException("fenced");
+        final ShareAcknowledgements acknowledgements = ShareAcknowledgements.empty();
+        final ShareGroupMetadata metadata = new ShareGroupMetadata("share-group", "member", 3);
+        doThrow(fence)
+            .when(mockedProducer)
+            .sendShareAcknowledgementsToTransaction(acknowledgements, metadata);
+
+        final TaskMigratedException exception = assertThrows(
+            TaskMigratedException.class,
+            () -> eosStreamsProducerWithMock.sendShareAcknowledgementsToTransaction(
+                acknowledgements,
+                metadata
+            )
+        );
+
+        assertThat(exception.getCause(), is(fence));
     }
 
     // error handling tests
