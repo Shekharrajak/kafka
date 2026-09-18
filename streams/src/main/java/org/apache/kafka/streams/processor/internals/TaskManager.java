@@ -1887,6 +1887,17 @@ public class TaskManager {
         }
     }
 
+    void addShareIngressRecordsToTasks(final ConsumerRecords<byte[], byte[]> records,
+                                       final ShareIngressAssignment assignment) {
+        for (final TopicPartition partition : records.partitions()) {
+            final Task activeTask = getActiveTask(partition);
+            if (!(activeTask instanceof StreamTask)) {
+                throw new IllegalStateException("Active task for ingress partition " + partition + " is not a stream task");
+            }
+            ((StreamTask) activeTask).addShareIngressRecords(partition, records.records(partition), assignment);
+        }
+    }
+
     /**
      * Update the next offsets for each task
      *

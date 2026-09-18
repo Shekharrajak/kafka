@@ -23,6 +23,8 @@ import org.apache.kafka.clients.admin.RecordsToDelete;
 import org.apache.kafka.clients.consumer.CommitFailedException;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerGroupMetadata;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.consumer.internals.StreamsRebalanceData;
 import org.apache.kafka.common.KafkaException;
@@ -241,6 +243,34 @@ public class TaskManagerTest {
         );
         taskManager.setMainConsumer(consumer);
         return taskManager;
+    }
+
+    @Test
+    public void shouldRouteShareIngressRecordsToThePhysicalPartitionOwner() {
+        final TasksRegistry tasks = mock(TasksRegistry.class);
+        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+        final TopicPartition ingressPartition = new TopicPartition("application-topic1-share-ingress", 0);
+        final ShareIngressAssignment assignment = new ShareIngressAssignment(
+            "application",
+            Map.of(taskId00, Set.of(t1p0))
+        );
+        final StreamTask activeTask = mock(StreamTask.class);
+        final ConsumerRecord<byte[], byte[]> ingressRecord = new ConsumerRecord<>(
+            ingressPartition.topic(),
+            ingressPartition.partition(),
+            9L,
+            null,
+            null
+        );
+        final ConsumerRecords<byte[], byte[]> records = new ConsumerRecords<>(
+            Map.of(ingressPartition, List.of(ingressRecord)),
+            Map.of()
+        );
+        when(tasks.activeInitializedTasksForInputPartition(ingressPartition)).thenReturn(activeTask);
+
+        taskManager.addShareIngressRecordsToTasks(records, assignment);
+
+        verify(activeTask).addShareIngressRecords(ingressPartition, List.of(ingressRecord), assignment);
     }
 
     @Test
