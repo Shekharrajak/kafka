@@ -65,4 +65,33 @@ class ShareIngressAssignmentTest {
 
         assertThrows(IllegalArgumentException.class, () -> assignment.targetTask(new TopicPartition("source", 1)));
     }
+
+    @Test
+    void shouldDeriveIngressPartitionsForTheCurrentTaskAssignment() {
+        final TaskId firstTask = new TaskId(0, 0);
+        final TaskId secondTask = new TaskId(0, 1);
+        final ShareIngressAssignment assignment = new ShareIngressAssignment(
+            "application",
+            Map.of(
+                firstTask, Set.of(new TopicPartition("source-a", 0), new TopicPartition("source-b", 0)),
+                secondTask, Set.of(new TopicPartition("source-a", 1))
+            )
+        );
+
+        assertEquals(
+            Map.of(
+                firstTask, Set.of(
+                    new TopicPartition("application-source-a-share-ingress", 0),
+                    new TopicPartition("application-source-b-share-ingress", 0)
+                ),
+                secondTask, Set.of(new TopicPartition("application-source-a-share-ingress", 1))
+            ),
+            assignment.ingressPartitionsByTask()
+        );
+        assertEquals(firstTask, assignment.targetTaskForIngress(new TopicPartition("application-source-b-share-ingress", 0)));
+        assertEquals(
+            new TopicPartition("source-b", 0),
+            assignment.sourcePartitionForIngress(new TopicPartition("application-source-b-share-ingress", 0))
+        );
+    }
 }
