@@ -114,6 +114,24 @@ public class InternalStreamsBuilder implements InternalNameProvider {
                                  this);
     }
 
+    public <K, V> KStream<K, V> shareStream(final Collection<String> topics,
+                                            final ConsumedInternal<K, V> consumed) {
+        final String name = new NamedInternal(consumed.name()).orElseGenerateWithPrefix(this, KStreamImpl.SOURCE_NAME);
+        final StreamSourceNode<K, V> streamSourceNode = new StreamSourceNode<>(name, topics, consumed) {
+            @Override
+            public void writeToTopology(final InternalTopologyBuilder topologyBuilder) {
+                topologyBuilder.addShareSource(consumedInternal().offsetResetPolicy(), nodeName(),
+                    consumedInternal().timestampExtractor(), consumedInternal().keyDeserializer(),
+                    consumedInternal().valueDeserializer(), topicNames().get().toArray(new String[0]));
+            }
+        };
+
+        addGraphNode(root, streamSourceNode);
+
+        return new KStreamImpl<>(name, consumed.keySerde(), consumed.valueSerde(), Set.of(name), false,
+            streamSourceNode, this);
+    }
+
     public <K, V> KStream<K, V> stream(final Pattern topicPattern,
                                        final ConsumedInternal<K, V> consumed) {
         final String name = new NamedInternal(consumed.name()).orElseGenerateWithPrefix(this, KStreamImpl.SOURCE_NAME);

@@ -26,10 +26,13 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.mockito.junit.jupiter.MockitoSettings;
 import org.mockito.quality.Strictness;
 
+import java.util.Set;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 
 @ExtendWith(MockitoExtension.class)
@@ -37,6 +40,16 @@ import static org.mockito.Mockito.mock;
 public class TopologyMetadataTest {
     static final String TOPOLOGY1 = "topology1";
     static final String TOPOLOGY2 = "topology2";
+
+    @Test
+    public void shouldExposeShareSourceTopics() {
+        final InternalTopologyBuilder internalTopologyBuilder = mock(InternalTopologyBuilder.class);
+        when(internalTopologyBuilder.shareSourceTopicNames()).thenReturn(Set.of("share-topic"));
+
+        final TopologyMetadata topologyMetadata = new TopologyMetadata(internalTopologyBuilder, new DummyStreamsConfig());
+
+        assertEquals(Set.of("share-topic"), topologyMetadata.shareSourceTopicNames());
+    }
 
     @Test
     public void testPauseResume() {

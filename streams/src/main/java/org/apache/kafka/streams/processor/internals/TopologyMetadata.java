@@ -461,6 +461,12 @@ public class TopologyMetadata {
         return sourceTopics;
     }
 
+    public Set<String> shareSourceTopicNames() {
+        final Set<String> sourceTopics = new HashSet<>();
+        applyToEachBuilder(b -> sourceTopics.addAll(b.shareSourceTopicNames()));
+        return Set.copyOf(sourceTopics);
+    }
+
     Pattern sourceTopicPattern() {
         final StringBuilder patternBuilder = new StringBuilder();
 

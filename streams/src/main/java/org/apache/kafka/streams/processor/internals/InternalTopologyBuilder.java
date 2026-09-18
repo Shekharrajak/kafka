@@ -128,6 +128,7 @@ public class InternalTopologyBuilder {
 
     // map from source processor names to subscribed topics (without application-id prefix for internal topics)
     private final Map<String, List<String>> nodeToSourceTopics = new HashMap<>();
+    private final Set<String> shareSourceTopics = new HashSet<>();
 
     // map from source processor names to regex subscription patterns
     private final Map<String, Pattern> nodeToSourcePatterns = new LinkedHashMap<>();
@@ -494,6 +495,16 @@ public class InternalTopologyBuilder {
         nodeToSourceTopics.put(name, Arrays.asList(topics));
         nodeGrouper.add(name);
         nodeGroups = null;
+    }
+
+    public final void addShareSource(final AutoOffsetResetInternal offsetReset,
+                                     final String name,
+                                     final TimestampExtractor timestampExtractor,
+                                     final Deserializer<?> keyDeserializer,
+                                     final Deserializer<?> valDeserializer,
+                                     final String... topics) {
+        addSource(offsetReset, name, timestampExtractor, keyDeserializer, valDeserializer, topics);
+        Collections.addAll(shareSourceTopics, topics);
     }
 
     public final void addSource(final AutoOffsetResetInternal offsetReset,
@@ -1536,6 +1547,10 @@ public class InternalTopologyBuilder {
             Collections.sort(fullSourceTopicNames);
         }
         return fullSourceTopicNames;
+    }
+
+    public Set<String> shareSourceTopicNames() {
+        return Collections.unmodifiableSet(shareSourceTopics);
     }
 
     synchronized String sourceTopicPatternString() {

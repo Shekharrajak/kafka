@@ -144,6 +144,15 @@ public class InternalTopologyBuilderTest {
     }
 
     @Test
+    public void shouldTrackShareSourceTopics() {
+        builder.addShareSource(null, "share-source", null, stringSerde.deserializer(), stringSerde.deserializer(), "share-topic");
+        builder.initializeSubscription();
+
+        assertEquals(Collections.singletonList("share-topic"), builder.fullSourceTopicNames());
+        assertEquals(Set.of("share-topic"), builder.shareSourceTopicNames());
+    }
+
+    @Test
     public void shouldAddPatternSourceWithoutOffsetReset() {
         final Pattern expectedPattern = Pattern.compile("test-.*");
 

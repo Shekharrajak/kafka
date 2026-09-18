@@ -182,6 +182,17 @@ public class StreamsBuilder {
         return internalStreamsBuilder.stream(topics, new ConsumedInternal<>(consumed));
     }
 
+    /**
+     * Create a {@link KStream} whose source records are consumed through a share group.
+     *
+     * @param topics the topic names; must contain at least one topic name
+     * @return a {@link KStream} for the specified topics
+     */
+    public synchronized <K, V> KStream<K, V> shareStream(final Collection<String> topics) {
+        Objects.requireNonNull(topics, "topics can't be null");
+        return internalStreamsBuilder.shareStream(topics, new ConsumedInternal<>(Consumed.with(null, null)));
+    }
+
 
     /**
      * Create a {@link KStream} from the specified topic pattern.
