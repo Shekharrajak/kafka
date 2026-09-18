@@ -18,6 +18,7 @@ package org.apache.kafka.streams.processor.internals;
 
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.streams.processor.TaskId;
 
 import java.util.Optional;
 import java.util.Set;
@@ -74,6 +75,11 @@ abstract class AbstractPartitionGroup {
      * @return the queue size for the partition
      */
     abstract int addRawRecords(TopicPartition partition, Iterable<ConsumerRecord<byte[], byte[]>> rawRecords);
+
+    abstract int addShareIngressRecords(TaskId taskId,
+                                        TopicPartition partition,
+                                        Iterable<ConsumerRecord<byte[], byte[]>> ingressRecords,
+                                        ShareIngressAssignment assignment);
 
     abstract long partitionTimestamp(final TopicPartition partition);
 

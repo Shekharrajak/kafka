@@ -2817,6 +2817,61 @@ public class StreamTaskTest {
     }
 
     @Test
+    public void shouldProcessShareIngressUsingOriginalSourceAndCommitPhysicalIngressOffset() {
+        when(stateManager.taskId()).thenReturn(taskId);
+        when(stateManager.taskType()).thenReturn(TaskType.ACTIVE);
+        final TopicPartition ingressPartition = new TopicPartition("application-topic1-share-ingress", 0);
+        final ShareIngressAssignment assignment = new ShareIngressAssignment(
+            "application",
+            Map.of(taskId, Set.of(partition1))
+        );
+        final ProcessorTopology topology = withSources(
+            singletonList(source1),
+            singletonMap(topic1, source1)
+        );
+        final StreamsConfig config = createConfig(AT_LEAST_ONCE, "0");
+        final InternalProcessorContext<?, ?> context = new ProcessorContextImpl(
+            taskId,
+            config,
+            stateManager,
+            streamsMetrics,
+            null
+        );
+        task = new StreamTask(
+            taskId,
+            Set.of(ingressPartition),
+            topology,
+            consumer,
+            new TopologyConfig(null, config, new Properties()).getTaskConfig(),
+            streamsMetrics,
+            stateDirectory,
+            cache,
+            time,
+            stateManager,
+            recordCollector,
+            context,
+            logContext,
+            false,
+            assignment::sourcePartitionForIngress
+        );
+        task.initializeIfNeeded();
+        task.completeRestoration(noOpResetter -> { });
+
+        task.addShareIngressRecords(ingressPartition, List.of(
+            shareIngressRecord(ingressPartition, 9L, 7, getConsumerRecordWithOffsetAsTimestamp(partition1, 42L)),
+            shareIngressRecord(ingressPartition, 11L, 8, getConsumerRecordWithOffsetAsTimestamp(partition1, 43L))
+        ), assignment);
+
+        assertTrue(task.process(0L));
+        assertThat(source1.keys, equalTo(singletonList(1)));
+        assertThat(source1.values, equalTo(singletonList(10)));
+        final TopicPartitionMetadata metadata = new TopicPartitionMetadata(42L, new ProcessorMetadata());
+        assertThat(task.prepareCommit(true), equalTo(mkMap(
+            mkEntry(ingressPartition, new OffsetAndMetadata(11L, Optional.of(8), metadata.encode()))
+        )));
+    }
+
+    @Test
     public void shouldThrowIfCleanClosingDirtyTask() {
         when(stateManager.taskId()).thenReturn(taskId);
         when(stateManager.taskType()).thenReturn(TaskType.ACTIVE);
@@ -3805,6 +3860,25 @@ public class StreamTaskTest {
             recordValue,
             new RecordHeaders(),
             Optional.empty()
+        );
+    }
+
+    private ConsumerRecord<byte[], byte[]> shareIngressRecord(final TopicPartition ingressPartition,
+                                                               final long ingressOffset,
+                                                               final int ingressLeaderEpoch,
+                                                               final ConsumerRecord<byte[], byte[]> sourceRecord) {
+        return new ConsumerRecord<>(
+            ingressPartition.topic(),
+            ingressPartition.partition(),
+            ingressOffset,
+            sourceRecord.timestamp(),
+            TimestampType.CREATE_TIME,
+            -1,
+            0,
+            null,
+            ShareIngressRecordSerde.serialize(new ShareIngressRecord(taskId, sourceRecord)),
+            new RecordHeaders(),
+            Optional.of(ingressLeaderEpoch)
         );
     }
 

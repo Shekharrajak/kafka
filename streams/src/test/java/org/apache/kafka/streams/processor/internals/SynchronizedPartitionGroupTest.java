@@ -18,6 +18,7 @@ package org.apache.kafka.streams.processor.internals;
 
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.streams.processor.TaskId;
 import org.apache.kafka.streams.processor.internals.AbstractPartitionGroup.RecordInfo;
 
 import org.junit.jupiter.api.AfterEach;
@@ -113,6 +114,20 @@ public class SynchronizedPartitionGroupTest {
     }
 
     @Test
+    public void testAddShareIngressRecords() {
+        final TaskId taskId = new TaskId(0, 0);
+        final TopicPartition partition = new TopicPartition("topic", 0);
+        @SuppressWarnings("unchecked") final Iterable<ConsumerRecord<byte[], byte[]>> records = (Iterable<ConsumerRecord<byte[], byte[]>>) mock(Iterable.class);
+        final ShareIngressAssignment assignment = mock(ShareIngressAssignment.class);
+        when(wrapped.addShareIngressRecords(taskId, partition, records, assignment)).thenReturn(1);
+
+        final int result = synchronizedPartitionGroup.addShareIngressRecords(taskId, partition, records, assignment);
+
+        assertEquals(1, result);
+        verify(wrapped, times(1)).addShareIngressRecords(taskId, partition, records, assignment);
+    }
+
+    @Test
     public void testPartitionTimestamp() {
         final TopicPartition partition = new TopicPartition("topic", 0);
         final long timestamp = 12345678L;
@@ -145,6 +160,18 @@ public class SynchronizedPartitionGroupTest {
 
         assertEquals(recordOffset, result);
         verify(wrapped, times(1)).headRecordOffset(partition);
+    }
+
+    @Test
+    public void testHeadRecordLeaderEpoch() {
+        final TopicPartition partition = new TopicPartition("topic", 0);
+        final Optional<Integer> leaderEpoch = Optional.of(3);
+        when(wrapped.headRecordLeaderEpoch(partition)).thenReturn(leaderEpoch);
+
+        final Optional<Integer> result = synchronizedPartitionGroup.headRecordLeaderEpoch(partition);
+
+        assertEquals(leaderEpoch, result);
+        verify(wrapped, times(1)).headRecordLeaderEpoch(partition);
     }
 
     @Test

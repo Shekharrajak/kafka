@@ -18,6 +18,7 @@ package org.apache.kafka.streams.processor.internals;
 
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.streams.processor.TaskId;
 
 import java.util.Optional;
 import java.util.Set;
@@ -57,6 +58,14 @@ class SynchronizedPartitionGroup extends AbstractPartitionGroup {
     }
 
     @Override
+    synchronized int addShareIngressRecords(final TaskId taskId,
+                                             final TopicPartition partition,
+                                             final Iterable<ConsumerRecord<byte[], byte[]>> ingressRecords,
+                                             final ShareIngressAssignment assignment) {
+        return wrapped.addShareIngressRecords(taskId, partition, ingressRecords, assignment);
+    }
+
+    @Override
     synchronized long partitionTimestamp(final TopicPartition partition) {
         return wrapped.partitionTimestamp(partition);
     }
@@ -72,8 +81,8 @@ class SynchronizedPartitionGroup extends AbstractPartitionGroup {
     }
 
     @Override
-    Optional<Integer> headRecordLeaderEpoch(final TopicPartition partition) {
-        return Optional.empty();
+    synchronized Optional<Integer> headRecordLeaderEpoch(final TopicPartition partition) {
+        return wrapped.headRecordLeaderEpoch(partition);
     }
 
     @Override

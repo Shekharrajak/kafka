@@ -140,6 +140,42 @@ public class StreamTask extends AbstractTask implements ProcessorNodePunctuator,
                       final LogContext logContext,
                       final boolean processingThreadsEnabled
                       ) {
+        this(
+            id,
+            inputPartitions,
+            topology,
+            mainConsumer,
+            config,
+            streamsMetrics,
+            stateDirectory,
+            cache,
+            time,
+            stateMgr,
+            recordCollector,
+            processorContext,
+            logContext,
+            processingThreadsEnabled,
+            Function.identity()
+        );
+    }
+
+    @SuppressWarnings({"rawtypes", "this-escape", "checkstyle:ParameterNumber"})
+    StreamTask(final TaskId id,
+               final Set<TopicPartition> inputPartitions,
+               final ProcessorTopology topology,
+               final Consumer<byte[], byte[]> mainConsumer,
+               final TaskConfig config,
+               final StreamsMetricsImpl streamsMetrics,
+               final StateDirectory stateDirectory,
+               final ThreadCache cache,
+               final Time time,
+               final ProcessorStateManager stateMgr,
+               final RecordCollector recordCollector,
+               final InternalProcessorContext processorContext,
+               final LogContext logContext,
+               final boolean processingThreadsEnabled,
+               final Function<TopicPartition, TopicPartition> sourcePartitionResolver
+               ) {
         super(
             id,
             topology,
@@ -197,7 +233,12 @@ public class StreamTask extends AbstractTask implements ProcessorNodePunctuator,
         resetOffsetsForPartitions = new HashSet<>();
         partitionsToResume = new HashSet<>();
 
-        recordQueueCreator = new RecordQueueCreator(this.logContext, config.timestampExtractor, config.deserializationExceptionHandler);
+        recordQueueCreator = new RecordQueueCreator(
+            this.logContext,
+            config.timestampExtractor,
+            config.deserializationExceptionHandler,
+            sourcePartitionResolver
+        );
 
         recordInfo = new RecordInfo();
 
@@ -1164,6 +1205,20 @@ public class StreamTask extends AbstractTask implements ProcessorNodePunctuator,
         }
     }
 
+    void addShareIngressRecords(final TopicPartition partition,
+                                final Iterable<ConsumerRecord<byte[], byte[]>> records,
+                                final ShareIngressAssignment assignment) {
+        final int newQueueSize = partitionGroup.addShareIngressRecords(id, partition, records, assignment);
+
+        if (log.isTraceEnabled()) {
+            log.trace("Added share ingress records into the buffered queue of partition {}, new queue size is {}", partition, newQueueSize);
+        }
+
+        if (newQueueSize > maxBufferedSize) {
+            mainConsumer.pause(Set.of(partition));
+        }
+    }
+
     public void updateNextOffsets(final TopicPartition partition, final OffsetAndMetadata offsetAndMetadata) {
         nextOffsetsAndMetadataToBeConsumed.put(partition, offsetAndMetadata);
     }
@@ -1547,20 +1602,24 @@ public class StreamTask extends AbstractTask implements ProcessorNodePunctuator,
         private final LogContext logContext;
         private final TimestampExtractor defaultTimestampExtractor;
         private final DeserializationExceptionHandler defaultDeserializationExceptionHandler;
+        private final Function<TopicPartition, TopicPartition> sourcePartitionResolver;
 
         private RecordQueueCreator(final LogContext logContext,
                                    final TimestampExtractor defaultTimestampExtractor,
-                                   final DeserializationExceptionHandler defaultDeserializationExceptionHandler) {
+                                   final DeserializationExceptionHandler defaultDeserializationExceptionHandler,
+                                   final Function<TopicPartition, TopicPartition> sourcePartitionResolver) {
             this.logContext = logContext;
             this.defaultTimestampExtractor = defaultTimestampExtractor;
             this.defaultDeserializationExceptionHandler = defaultDeserializationExceptionHandler;
+            this.sourcePartitionResolver = sourcePartitionResolver;
         }
 
         public RecordQueue createQueue(final TopicPartition partition) {
-            final SourceNode<?, ?> source = topology.source(partition.topic());
+            final TopicPartition sourcePartition = sourcePartitionResolver.apply(partition);
+            final SourceNode<?, ?> source = topology.source(sourcePartition.topic());
             if (source == null) {
                 throw new TopologyException(
-                        "Topic " + partition.topic() + " is unknown to the topology. " +
+                        "Topic " + sourcePartition.topic() + " is unknown to the topology. " +
                                 "This may happen if different KafkaStreams instances of the same application execute different Topologies. " +
                                 "Note that Topologies are only identical if all operators are added in the same order."
                 );

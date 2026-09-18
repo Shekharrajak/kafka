@@ -21,6 +21,7 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.metrics.Sensor;
 import org.apache.kafka.common.utils.internals.LogContext;
 import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.processor.TaskId;
 
 import org.slf4j.Logger;
 
@@ -289,8 +290,28 @@ class PartitionGroup extends AbstractPartitionGroup {
             throw new IllegalStateException("Partition " + partition + " not found.");
         }
 
+        return addRecords(recordQueue, rawRecords, recordQueue::addRawRecords);
+    }
+
+    @Override
+    int addShareIngressRecords(final TaskId taskId,
+                               final TopicPartition partition,
+                               final Iterable<ConsumerRecord<byte[], byte[]>> ingressRecords,
+                               final ShareIngressAssignment assignment) {
+        final RecordQueue recordQueue = partitionQueues.get(partition);
+
+        if (recordQueue == null) {
+            throw new IllegalStateException("Partition " + partition + " not found.");
+        }
+
+        return addRecords(recordQueue, ingressRecords, records -> recordQueue.addShareIngressRecords(taskId, records, assignment));
+    }
+
+    private int addRecords(final RecordQueue recordQueue,
+                           final Iterable<ConsumerRecord<byte[], byte[]>> records,
+                           final Function<Iterable<ConsumerRecord<byte[], byte[]>>, Integer> addRecords) {
         final int oldSize = recordQueue.size();
-        final int newSize = recordQueue.addRawRecords(rawRecords);
+        final int newSize = addRecords.apply(records);
 
         // add this record queue to be considered for processing in the future if it was empty before
         if (oldSize == 0 && newSize > 0) {
