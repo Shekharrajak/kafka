@@ -39,6 +39,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.same;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -119,6 +120,48 @@ class ShareIngressForwarderTest {
 
         verify(producer, never()).send(any());
         verify(consumer, never()).acknowledge(any(), any());
+    }
+
+    @SuppressWarnings("unchecked")
+    @Test
+    void shouldFlushIngressBeforeCompletingAtLeastOnceAcknowledgements() {
+        final Producer<byte[], byte[]> producer = mock(Producer.class);
+        final ShareConsumer<byte[], byte[]> consumer = mock(ShareConsumer.class);
+        final ShareGroupMetadata metadata = new ShareGroupMetadata("share-group", "member", 3);
+        final ConsumerRecord<byte[], byte[]> record = new ConsumerRecord<>("source", 1, 2L, new byte[] {1}, new byte[] {2});
+        final ShareSource.PollResult batch = poll(consumer, metadata, ShareAcknowledgements.empty(), record);
+        final ShareIngressAssignment assignment = new ShareIngressAssignment(
+            "application",
+            Map.of(new TaskId(0, 1), Set.of(new TopicPartition("source", 1)))
+        );
+
+        new ShareIngressForwarder(producer).forwardAtLeastOnce(batch, assignment);
+
+        final InOrder ordered = inOrder(producer, consumer);
+        ordered.verify(producer).send(any());
+        ordered.verify(producer).flush();
+        ordered.verify(consumer).acknowledge(record, AcknowledgeType.ACCEPT);
+        ordered.verify(consumer).commitSync();
+    }
+
+    @SuppressWarnings("unchecked")
+    @Test
+    void shouldNotAcknowledgeAtLeastOnceBatchWhenIngressFlushFails() {
+        final Producer<byte[], byte[]> producer = mock(Producer.class);
+        final ShareConsumer<byte[], byte[]> consumer = mock(ShareConsumer.class);
+        final ShareGroupMetadata metadata = new ShareGroupMetadata("share-group", "member", 3);
+        final ConsumerRecord<byte[], byte[]> record = new ConsumerRecord<>("source", 0, 2L, new byte[] {1}, new byte[] {2});
+        final ShareSource.PollResult batch = poll(consumer, metadata, ShareAcknowledgements.empty(), record);
+        final ShareIngressAssignment assignment = new ShareIngressAssignment(
+            "application",
+            Map.of(new TaskId(0, 0), Set.of(new TopicPartition("source", 0)))
+        );
+        doThrow(new KafkaException("flush failed")).when(producer).flush();
+
+        assertThrows(KafkaException.class, () -> new ShareIngressForwarder(producer).forwardAtLeastOnce(batch, assignment));
+
+        verify(consumer, never()).acknowledge(any(), any());
+        verify(consumer, never()).commitSync();
     }
 
     private static ShareSource.PollResult poll(final ShareConsumer<byte[], byte[]> consumer,

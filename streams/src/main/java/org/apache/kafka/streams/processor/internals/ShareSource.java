@@ -22,10 +22,14 @@ import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.ShareAcknowledgements;
 import org.apache.kafka.clients.consumer.ShareConsumer;
 import org.apache.kafka.clients.consumer.ShareGroupMetadata;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.TopicIdPartition;
 
 import java.time.Duration;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 
 final class ShareSource implements AutoCloseable {
@@ -143,6 +147,13 @@ final class ShareSource implements AutoCloseable {
                 throw new IllegalStateException("Cannot extract transaction acknowledgements containing RELEASE decisions.");
             }
             return consumer.acknowledgementsForTransaction();
+        }
+
+        Map<TopicIdPartition, Optional<KafkaException>> completeAcknowledgementsSynchronously() {
+            if (!allRecordsAreDecided()) {
+                throw new IllegalStateException("Cannot commit share acknowledgements while the current share batch has undecided records.");
+            }
+            return consumer.commitSync();
         }
 
         private boolean allRecordsAreDecided() {

@@ -23,6 +23,8 @@ import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.ShareAcknowledgements;
 import org.apache.kafka.clients.consumer.ShareConsumer;
 import org.apache.kafka.clients.consumer.ShareGroupMetadata;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.TopicPartition;
 
 import org.junit.jupiter.api.Test;
@@ -31,6 +33,7 @@ import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.is;
@@ -200,6 +203,31 @@ class ShareSourceTest {
 
         source.poll(timeout);
         verify(consumer, times(2)).poll(timeout);
+    }
+
+    @SuppressWarnings("unchecked")
+    @Test
+    void shouldCommitExplicitAcknowledgementsOnlyAfterEveryRecordIsDecided() {
+        final ShareConsumer<byte[], byte[]> consumer = mock(ShareConsumer.class);
+        final Duration timeout = Duration.ofMillis(100);
+        final ConsumerRecord<byte[], byte[]> firstRecord = record(1L);
+        final ConsumerRecord<byte[], byte[]> secondRecord = record(2L);
+        final Map<TopicIdPartition, Optional<KafkaException>> commitResult = Map.of();
+
+        when(consumer.poll(timeout)).thenReturn(records(firstRecord, secondRecord));
+        when(consumer.shareGroupMetadata()).thenReturn(new ShareGroupMetadata("share-group", "member", 3));
+        when(consumer.commitSync()).thenReturn(commitResult);
+
+        final ShareSource.PollResult batch = new ShareSource(consumer).poll(timeout);
+
+        assertThrows(IllegalStateException.class, () -> batch.acknowledgementOwner().completeAcknowledgementsSynchronously());
+        verify(consumer, never()).commitSync();
+
+        batch.acknowledgementOwner().acknowledge(firstRecord, AcknowledgeType.ACCEPT);
+        batch.acknowledgementOwner().acknowledge(secondRecord, AcknowledgeType.REJECT);
+
+        assertThat(batch.acknowledgementOwner().completeAcknowledgementsSynchronously(), sameInstance(commitResult));
+        verify(consumer).commitSync();
     }
 
     @SuppressWarnings("unchecked")
