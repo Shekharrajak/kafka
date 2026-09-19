@@ -26,6 +26,7 @@ import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicIdPartition;
 
 import java.time.Duration;
+import java.util.Collection;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Objects;
@@ -43,6 +44,10 @@ final class ShareSource implements AutoCloseable {
 
     ShareSource(final ShareConsumer<byte[], byte[]> consumer) {
         this.consumer = Objects.requireNonNull(consumer, "consumer cannot be null");
+    }
+
+    void subscribe(final Collection<String> topics) {
+        consumer.subscribe(topics);
     }
 
     PollResult poll(final Duration timeout) {

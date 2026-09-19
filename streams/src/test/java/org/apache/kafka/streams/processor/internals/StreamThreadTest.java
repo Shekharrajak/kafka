@@ -4884,6 +4884,20 @@ public class StreamThreadTest {
             Optional.empty()));
     }
 
+    @Test
+    public void shouldNotPollShareSourceUntilTasksAreRunning() {
+        final StreamsConfig config = new StreamsConfig(configProps(false, false));
+        final TopologyMetadata topologyMetadata = new TopologyMetadata(new InternalTopologyBuilder(), config);
+        when(consumer.groupMetadata()).thenReturn(new ConsumerGroupMetadata("group"));
+        final StreamThread streamThread = buildStreamThread(consumer, mockTaskManager(), config, topologyMetadata);
+        final ShareSource shareSource = mock(ShareSource.class);
+        streamThread.setShareSource(shareSource);
+
+        streamThread.pollShareSource();
+
+        verify(shareSource, never()).poll(Duration.ZERO);
+    }
+
     private StreamThread buildStreamThread(final Consumer<byte[], byte[]> consumer,
                                            final TaskManager taskManager,
                                            final StreamsConfig config,

@@ -350,12 +350,14 @@ public class StreamThread extends Thread implements ProcessingThread {
     private volatile ThreadMetadata threadMetadata;
     private StreamThread.StateListener stateListener;
     private final Optional<String> groupInstanceID;
+    private final String applicationId;
 
     private final ChangelogReader changelogReader;
     private final ConsumerRebalanceListener rebalanceListener;
     private final Optional<DefaultStreamsRebalanceListener> defaultStreamsRebalanceListener;
     private final Consumer<byte[], byte[]> mainConsumer;
     private final Consumer<byte[], byte[]> restoreConsumer;
+    private ShareSource shareSource;
     private final Admin adminClient;
     private final TopologyMetadata topologyMetadata;
     private final java.util.function.Consumer<Long> cacheResizer;
@@ -561,6 +563,14 @@ public class StreamThread extends Thread implements ProcessingThread {
             metricsReporter,
             maxUncommittedBytesPerThread
         );
+
+        if (!topologyMetadata.shareSourceTopicNames().isEmpty()) {
+            final ShareSource shareSource = new ShareSource(clientSupplier.getShareConsumer(
+                config.getShareConsumerConfigs(applicationId, threadId + "-share-consumer")
+            ));
+            shareSource.subscribe(topologyMetadata.shareSourceTopicNames());
+            streamThread.setShareSource(shareSource);
+        }
 
         return streamThread.updateThreadMetadata(adminClientId(clientId));
     }
@@ -913,6 +923,7 @@ public class StreamThread extends Thread implements ProcessingThread {
         this.nextProbingRebalanceMs = nextProbingRebalanceMs;
         this.nonFatalExceptionsToHandle = nonFatalExceptionsToHandle;
         this.groupInstanceID = mainConsumer.groupMetadata().groupInstanceId();
+        this.applicationId = config.getString(StreamsConfig.APPLICATION_ID_CONFIG);
 
         this.pollTime = Duration.ofMillis(config.getLong(StreamsConfig.POLL_MS_CONFIG));
         final int dummyThreadIdx = 1;
@@ -1270,6 +1281,8 @@ public class StreamThread extends Thread implements ProcessingThread {
             return;
         }
 
+        pollShareSource();
+
         // TODO: we should record the restore latency and its relative time spent ratio after
         //       we figure out how to move this method out of the stream thread
         advanceNowAndComputeLatency();
@@ -1474,6 +1487,26 @@ public class StreamThread extends Thread implements ProcessingThread {
         final boolean allRunning = taskManager.checkStateUpdater(now, offsetResetter);
         if (allRunning && stateSnapshot == State.PARTITIONS_ASSIGNED) {
             setState(State.RUNNING);
+        }
+    }
+
+    void pollShareSource() {
+        if (shareSource == null || state != State.RUNNING) {
+            return;
+        }
+        final ShareSource.PollResult batch = shareSource.poll(Duration.ZERO);
+        if (batch.records().isEmpty()) {
+            return;
+        }
+        final ShareIngressAssignment assignment = ShareIngressAssignment.fromActiveTasks(
+            applicationId,
+            taskManager.activeTasks(),
+            topologyMetadata.shareSourceTopicNames()
+        );
+        if (eosEnabled) {
+            new ShareIngressForwarder(taskManager.streamsProducer()).forward(batch, assignment);
+        } else {
+            new ShareIngressForwarder(taskManager.streamsProducer().kafkaProducer()).forwardAtLeastOnce(batch, assignment);
         }
     }
 
@@ -2021,6 +2054,13 @@ public class StreamThread extends Thread implements ProcessingThread {
         } catch (final Throwable e) {
             log.error("Failed to close restore consumer due to the following error:", e);
         }
+        if (shareSource != null) {
+            try {
+                shareSource.close();
+            } catch (final Throwable e) {
+                log.error("Failed to close share consumer due to the following error:", e);
+            }
+        }
         streamsMetrics.removeAllThreadLevelSensors(getName());
         streamsMetrics.removeAllThreadLevelMetrics(getName());
         streamsMetrics.metricsRegistry().removeReporter(metricsReporter);
@@ -2028,6 +2068,10 @@ public class StreamThread extends Thread implements ProcessingThread {
         setState(State.DEAD);
 
         log.info("Shutdown complete");
+    }
+
+    void setShareSource(final ShareSource shareSource) {
+        this.shareSource = shareSource;
     }
 
     /**

@@ -189,6 +189,10 @@ public class TaskManager {
         return activeTaskCreator.streamsProducer();
     }
 
+    Collection<StreamTask> activeTasks() {
+        return tasks.activeInitializedTasks();
+    }
+
     boolean rebalanceInProgress() {
         return rebalanceInProgress;
     }

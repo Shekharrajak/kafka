@@ -48,6 +48,15 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class ShareSourceTest {
+    @Test
+    void shouldSubscribeShareConsumerToDeclaredTopics() {
+        final ShareConsumer<byte[], byte[]> consumer = mock(ShareConsumer.class);
+
+        new ShareSource(consumer).subscribe(List.of("source-a", "source-b"));
+
+        verify(consumer).subscribe(List.of("source-a", "source-b"));
+    }
+
     @SuppressWarnings("unchecked")
     @Test
     void shouldExposeShareIdentityAndAcknowledgementOwnerFromPoll() {
