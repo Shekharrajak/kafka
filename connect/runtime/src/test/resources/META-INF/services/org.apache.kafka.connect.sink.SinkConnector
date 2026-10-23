@@ -20,3 +20,4 @@ org.apache.kafka.connect.integration.MonitorableSinkConnector
 org.apache.kafka.connect.integration.TestableSinkConnector
 org.apache.kafka.connect.runtime.SampleSinkConnector
 org.apache.kafka.connect.integration.ConnectWorkerIntegrationTest$EmptyTaskConfigsConnector
+org.apache.kafka.connect.integration.ShareSinkConnectorsIntegrationTest$AuditingShareSinkConnector
