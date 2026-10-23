@@ -39,6 +39,12 @@ import java.util.stream.Collectors;
 
 public class SinkConnectorConfig extends ConnectorConfig {
 
+    public static final String CONSUMER_TYPE_CONFIG = "consumer.type";
+    public static final String CONSUMER_TYPE_DEFAULT = "consumer";
+    public static final String SHARE_CONSUMER_TYPE = "share";
+    private static final String CONSUMER_TYPE_DOC = "Consumer type: consumer for partition offsets, or share for individual acknowledgements. "
+            + "Share consumption requires a ShareSinkTask with synchronous durable writes.";
+
     public static final String TOPICS_CONFIG = SinkTask.TOPICS_CONFIG;
     private static final String TOPICS_DOC = "List of topics to consume, separated by commas";
     public static final List<String> TOPICS_DEFAULT = List.of();
@@ -74,6 +80,8 @@ public class SinkConnectorConfig extends ConnectorConfig {
 
     private static ConfigDef configDef(ConfigDef baseConfigs) {
         return baseConfigs
+                .define(CONSUMER_TYPE_CONFIG, Type.STRING, CONSUMER_TYPE_DEFAULT,
+                        ConfigDef.ValidString.in(CONSUMER_TYPE_DEFAULT, SHARE_CONSUMER_TYPE), Importance.HIGH, CONSUMER_TYPE_DOC)
                 .define(TOPICS_CONFIG, ConfigDef.Type.LIST, TOPICS_DEFAULT, ConfigDef.ValidList.anyNonDuplicateValues(true, false), ConfigDef.Importance.HIGH, TOPICS_DOC, COMMON_GROUP, 4, ConfigDef.Width.LONG, TOPICS_DISPLAY)
                 .define(TOPICS_REGEX_CONFIG, ConfigDef.Type.STRING, TOPICS_REGEX_DEFAULT, new RegexValidator(), ConfigDef.Importance.HIGH, TOPICS_REGEX_DOC, COMMON_GROUP, 4, ConfigDef.Width.LONG, TOPICS_REGEX_DISPLAY)
                 .define(DLQ_TOPIC_NAME_CONFIG, ConfigDef.Type.STRING, DLQ_TOPIC_DEFAULT, Importance.MEDIUM, DLQ_TOPIC_NAME_DOC, ERROR_GROUP, 6, ConfigDef.Width.MEDIUM, DLQ_TOPIC_DISPLAY)
@@ -122,6 +130,7 @@ public class SinkConnectorConfig extends ConnectorConfig {
      *                        entry if one for the problematic property does not already exist.
      */
     public static void validate(Map<String, String> props, Map<String, ConfigValue> validatedConfig) {
+        validateConsumerType(props, validatedConfig);
         final String topicsList = props.get(TOPICS_CONFIG);
         final String topicsRegex = props.get(TOPICS_REGEX_CONFIG);
         final String dlqTopic = props.getOrDefault(DLQ_TOPIC_NAME_CONFIG, "").trim();
@@ -165,6 +174,24 @@ public class SinkConnectorConfig extends ConnectorConfig {
         }
     }
 
+    private static void validateConsumerType(Map<String, String> props, Map<String, ConfigValue> validatedConfig) {
+        String consumerType = props.getOrDefault(CONSUMER_TYPE_CONFIG, CONSUMER_TYPE_DEFAULT);
+        if (!CONSUMER_TYPE_DEFAULT.equals(consumerType) && !SHARE_CONSUMER_TYPE.equals(consumerType)) {
+            addErrorMessage(validatedConfig, CONSUMER_TYPE_CONFIG, consumerType, "Expected consumer or share");
+        }
+        if (usesShareConsumer(props)) {
+            for (String key : List.of(TOPICS_REGEX_CONFIG, DLQ_TOPIC_NAME_CONFIG)) {
+                if (!Utils.isBlank(props.get(key))) {
+                    addErrorMessage(validatedConfig, key, props.get(key), "Unsupported with share consumption");
+                }
+            }
+            String tolerance = props.getOrDefault(ERRORS_TOLERANCE_CONFIG, "none");
+            if (!"none".equals(tolerance)) {
+                addErrorMessage(validatedConfig, ERRORS_TOLERANCE_CONFIG, tolerance, "Share consumption requires errors.tolerance=none");
+            }
+        }
+    }
+
     private static void addErrorMessage(Map<String, ConfigValue> validatedConfig, String name, String value, String errorMessage) {
         validatedConfig.computeIfAbsent(
                 name,
@@ -172,6 +199,10 @@ public class SinkConnectorConfig extends ConnectorConfig {
         ).addErrorMessage(
                 errorMessage
         );
+    }
+
+    public static boolean usesShareConsumer(Map<String, String> props) {
+        return SHARE_CONSUMER_TYPE.equals(props.get(CONSUMER_TYPE_CONFIG));
     }
 
     public static boolean hasTopicsConfig(Map<String, String> props) {
