@@ -179,6 +179,7 @@ import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.withSettings;
@@ -2109,6 +2110,28 @@ public class WorkerTest {
 
         verifyKafkaClusterId();
         verifyGenericIsolation();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    public void testShareSinkOffsetsAreNotInterpretedAsConsumerOffsets(boolean enableTopicCreation) {
+        setup(enableTopicCreation);
+        mockKafkaClusterId();
+        Admin admin = mock(Admin.class);
+        worker = new Worker(WORKER_ID, new MockTime(), plugins, config, offsetBackingStore, executorService,
+                allConnectorClientConfigOverridePolicy, ignored -> admin);
+        worker.start();
+        connectorProps.put(SinkConnectorConfig.CONSUMER_TYPE_CONFIG, SinkConnectorConfig.SHARE_CONSUMER_TYPE);
+        FutureCallback<ConnectorOffsets> read = new FutureCallback<>();
+        worker.sinkConnectorOffsets(CONNECTOR_ID, sinkConnector, connectorProps, read);
+        assertInstanceOf(ConnectException.class, assertThrows(ExecutionException.class,
+                () -> read.get(1, TimeUnit.SECONDS)).getCause());
+        FutureCallback<Message> modify = new FutureCallback<>();
+        worker.modifySinkConnectorOffsets(CONNECTOR_ID, sinkConnector, connectorProps, null, getClass().getClassLoader(), modify);
+        assertInstanceOf(ConnectException.class, assertThrows(ExecutionException.class,
+                () -> modify.get(1, TimeUnit.SECONDS)).getCause());
+        verifyNoInteractions(admin);
+        verifyKafkaClusterId();
     }
 
     @ParameterizedTest

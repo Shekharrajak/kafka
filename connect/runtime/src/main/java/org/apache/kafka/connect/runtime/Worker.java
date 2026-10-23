@@ -29,6 +29,7 @@ import org.apache.kafka.clients.admin.ListConsumerGroupOffsetsResult;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.consumer.KafkaShareConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.Producer;
@@ -75,6 +76,7 @@ import org.apache.kafka.connect.runtime.rest.RestServer;
 import org.apache.kafka.connect.runtime.rest.entities.ConnectorOffset;
 import org.apache.kafka.connect.runtime.rest.entities.ConnectorOffsets;
 import org.apache.kafka.connect.runtime.rest.entities.Message;
+import org.apache.kafka.connect.sink.ShareSinkTask;
 import org.apache.kafka.connect.sink.SinkConnector;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTask;
@@ -1323,6 +1325,10 @@ public final class Worker {
      */
     void sinkConnectorOffsets(String connName, Connector connector, Map<String, String> connectorConfig,
                               Callback<ConnectorOffsets> cb) {
+        if (SinkConnectorConfig.usesShareConsumer(connectorConfig)) {
+            cb.onCompletion(new ConnectException("Share sink offset inspection is unsupported; use share-group administration"), null);
+            return;
+        }
         Map<String, Object> adminConfig = adminConfigs(
                 connName,
                 "connector-worker-adminclient-" + connName,
@@ -1459,6 +1465,10 @@ public final class Worker {
      */
     void modifySinkConnectorOffsets(String connName, Connector connector, Map<String, String> connectorConfig,
                                     Map<Map<String, ?>, Map<String, ?>> offsets, boolean replaceAllOffsets, ClassLoader connectorLoader, Callback<Message> cb) {
+        if (SinkConnectorConfig.usesShareConsumer(connectorConfig)) {
+            cb.onCompletion(new ConnectException("Share sink offset changes are unsupported; use share-group administration"), null);
+            return;
+        }
         executor.submit(plugins.withClassLoader(connectorLoader, () -> {
             try {
                 Timer timer = time.timer(Duration.ofMillis(RestServer.DEFAULT_REST_REQUEST_TIMEOUT_MS));
@@ -2005,6 +2015,25 @@ public final class Worker {
                 TaskPluginsMetadata taskPluginsMetadata
         ) {
             SinkConnectorConfig sinkConfig = new SinkConnectorConfig(plugins, connectorConfig.originalsStrings());
+            if (SinkConnectorConfig.usesShareConsumer(sinkConfig.originalsStrings())) {
+                SinkConnectorConfig.validate(sinkConfig.originalsStrings());
+                if (!(task instanceof ShareSinkTask shareTask)) {
+                    throw new ConnectException("Share consumption requires a ShareSinkTask with synchronous durable writes");
+                }
+                Map<String, Object> baseProps = baseConsumerConfigs(
+                        id.connector(), "connector-share-consumer-" + id, config, connectorConfig, connectorClass,
+                        connectorClientConfigOverridePolicy, kafkaClusterId, ConnectorType.SINK);
+                Map<String, Object> shareProps = ShareConsumerSettings.create(id.connector(), baseProps,
+                        config.originalsWithPrefix("consumer."),
+                        connectorConfig.originalsWithPrefix(ConnectorConfig.CONNECTOR_CLIENT_CONSUMER_OVERRIDES_PREFIX));
+                return new WorkerShareSinkTask(shareTask, new KafkaShareConsumer<>(shareProps),
+                        new WorkerShareSinkTask.RuntimeContext(id, statusListener, initialState, config, configState,
+                                sinkConfig, metrics, classLoader, time, herder.statusBackingStore(), taskPluginsMetadata,
+                                plugins.safeLoaderSwapper()),
+                        new WorkerShareSinkTask.Processing(keyConverterPlugin, valueConverterPlugin, headerConverterPlugin,
+                                errorHandlingMetrics, transformationChain, retryWithToleranceOperator,
+                                () -> sinkTaskReporters(id, sinkConfig, errorHandlingMetrics, connectorClass)));
+            }
             WorkerErrantRecordReporter workerErrantRecordReporter = createWorkerErrantRecordReporter(sinkConfig, retryWithToleranceOperator,
                     keyConverterPlugin.get(), valueConverterPlugin.get(), headerConverterPlugin.get());
 
