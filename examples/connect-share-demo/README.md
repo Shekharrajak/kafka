@@ -46,6 +46,11 @@ by default. All published ports bind to localhost. Kafka UI is a read-only topic
 and ordinary-group viewer; share membership, eligibility and lag come from the
 Admin collector, independently of UI share-group support.
 
+If another demo owns the monitoring ports, set `DEMO_GRAFANA_PORT`,
+`DEMO_PROMETHEUS_PORT` and `DEMO_CONTROL_PORT` for Compose. Pass the corresponding
+`--url` to the runner, validation and fault commands, `--grafana` to the runner
+and dashboard validation, and `--prometheus` to validation and fault commands.
+
 ## Run the comparison
 
 ```bash
@@ -126,8 +131,14 @@ native source progress, and an independent bounded physical output scan.
 ./gradlew :examples:connect-share-demo:test :examples:connect-share-demo:spotlessCheck --max-workers=2 -PmaxParallelForks=1
 python3 -m unittest discover -s examples/connect-share-demo/scripts -p 'test_*.py'
 python3 examples/connect-share-demo/scripts/native_smoke.py --recovery
+python3 examples/connect-share-demo/scripts/validate_dashboard.py --run-id YOUR_RUN_ID
 docker compose -f examples/connect-share-demo/compose.yaml down
 ```
+
+Run dashboard validation before starting the next comparison. It checks every
+panel query over the active and full-run windows, the provisioned dashboard and
+the Grafana datasource path. It saves raw query evidence under `results/`;
+browser rendering still needs a visual check.
 
 The native smoke test starts its own broker, two Connect JVMs and nine tasks per
 mode on random local ports, then stops only those processes. `--recovery` adds an

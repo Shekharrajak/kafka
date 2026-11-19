@@ -85,7 +85,7 @@ services:
       SHARE_CONNECT: http://share-1:8083
       DATA_DIR: /data
       SHARE_POLICY: ${SHARE_ASSIGNOR:-simple}
-    ports: ['127.0.0.1:8090:8090']
+    ports: ['127.0.0.1:${DEMO_CONTROL_PORT:-8090}:8090']
     volumes: [control-data:/data]
     depends_on:
       classic-1: {condition: service_healthy}
@@ -99,7 +99,7 @@ services:
     image: prom/prometheus:v3.2.1
     command: ['--config.file=/etc/prometheus/prometheus.yaml', '--storage.tsdb.retention.time=6h', '--storage.tsdb.retention.size=512MB']
     mem_limit: 512m
-    ports: ['127.0.0.1:9090:9090']
+    ports: ['127.0.0.1:${DEMO_PROMETHEUS_PORT:-9090}:9090']
     volumes:
       - ./config/prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
       - prometheus-data:/prometheus
@@ -112,7 +112,7 @@ services:
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
       GF_AUTH_DISABLE_LOGIN_FORM: 'true'
       GF_ANALYTICS_REPORTING_ENABLED: 'false'
-    ports: ['127.0.0.1:3000:3000']
+    ports: ['127.0.0.1:${DEMO_GRAFANA_PORT:-3000}:3000']
     volumes:
       - ./dashboard/datasource.yaml:/etc/grafana/provisioning/datasources/demo.yaml:ro
       - ./dashboard/provider.yaml:/etc/grafana/provisioning/dashboards/demo.yaml:ro
