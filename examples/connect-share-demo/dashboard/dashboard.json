@@ -1,0 +1,3852 @@
+{
+  "uid": "connect-share-comparison",
+  "title": "Kafka Connect - consumer group vs share group",
+  "description": "Finite, verified at-least-once KIP-1302 comparison. Ordinary left, share right. Never substitutes fetched/ACK counts for useful completed work.",
+  "tags": [
+    "kafka",
+    "connect",
+    "share-groups",
+    "kip-1302"
+  ],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "5s",
+  "timezone": "browser",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "5s",
+      "10s",
+      "30s",
+      "1m"
+    ]
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "run_id",
+        "label": "Run",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "demo-prom"
+        },
+        "definition": "label_values(demo_published_total, run_id)",
+        "query": {
+          "query": "label_values(demo_published_total, run_id)",
+          "refId": "RunVariable"
+        },
+        "refresh": 1,
+        "sort": 2,
+        "multi": false,
+        "includeAll": false
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "links": [
+    {
+      "title": "Kafka UI",
+      "url": "http://localhost:8080",
+      "targetBlank": true
+    },
+    {
+      "title": "Controller state",
+      "url": "http://localhost:8090/state",
+      "targetBlank": true
+    },
+    {
+      "title": "Prometheus targets",
+      "url": "http://localhost:9090/targets",
+      "targetBlank": true
+    }
+  ],
+  "panels": [
+    {
+      "type": "text",
+      "title": "Kafka Connect: consumer groups vs share groups",
+      "options": {
+        "mode": "markdown",
+        "content": "Same input corpus and three input partitions. Ordinary group on the left; share group on the right. Experimental KIP-1302 Connect build; **at least once**. Empty or missing metrics remain unknown."
+      },
+      "id": 1,
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 3
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Selected scenario / tasks / share policy",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "demo_run_info{run_id=\"$run_id\"}",
+          "legendFormat": "{{scenario}} / {{tasks}} tasks / {{share_policy}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "time_series"
+        }
+      ],
+      "options": {
+        "textMode": "name",
+        "colorMode": "none",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "No selected run"
+        },
+        "overrides": []
+      },
+      "id": 2,
+      "gridPos": {
+        "x": 0,
+        "y": 3,
+        "w": 16,
+        "h": 3
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Run phase",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "demo_run_status{run_id=\"$run_id\"} == 1",
+          "legendFormat": "{{status}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "time_series"
+        }
+      ],
+      "options": {
+        "textMode": "name",
+        "colorMode": "none",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "Unknown"
+        },
+        "overrides": []
+      },
+      "id": 3,
+      "gridPos": {
+        "x": 16,
+        "y": 3,
+        "w": 8,
+        "h": 3
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Confirmed input publication by partition",
+      "description": "Successful producer acknowledgements for unique input jobs. This is offered load, not sink completion.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (partition) (rate(demo_published_total{run_id=\"$run_id\"}[30s]))",
+          "legendFormat": "P{{partition}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        }
+      ],
+      "id": 4,
+      "gridPos": {
+        "x": 0,
+        "y": 6,
+        "w": 24,
+        "h": 7
+      }
+    },
+    {
+      "type": "text",
+      "title": "Ordinary consumer group",
+      "options": {
+        "mode": "markdown",
+        "content": "Exclusive partition readers"
+      },
+      "id": 5,
+      "gridPos": {
+        "x": 0,
+        "y": 13,
+        "w": 12,
+        "h": 2
+      }
+    },
+    {
+      "type": "text",
+      "title": "Share group",
+      "options": {
+        "mode": "markdown",
+        "content": "Distinct acquired records; sharing follows the selected broker policy"
+      },
+      "id": 6,
+      "gridPos": {
+        "x": 12,
+        "y": 13,
+        "w": 12,
+        "h": 2
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Verified / sec",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(demo_verified_total{run_id=\"$run_id\",mode=\"classic\"}[30s]))",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "time_series"
+        }
+      ],
+      "options": {
+        "textMode": "value",
+        "colorMode": "none",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "noValue": "Unknown"
+        },
+        "overrides": []
+      },
+      "id": 7,
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 3,
+        "h": 4
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Unfinished",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(demo_unfinished{run_id=\"$run_id\",mode=\"classic\"})",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "time_series"
+        }
+      ],
+      "options": {
+        "textMode": "value",
+        "colorMode": "none",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "Unknown"
+        },
+        "overrides": []
+      },
+      "id": 8,
+      "gridPos": {
+        "x": 3,
+        "y": 15,
+        "w": 3,
+        "h": 4
+      }
+    },
+    {
+      "type": "stat",
+      "title": "E2E p95",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95,sum by (le) (rate(demo_e2e_seconds_bucket{run_id=\"$run_id\",mode=\"classic\"}[30s])))",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "time_series"
+        }
+      ],
+      "options": {
+        "textMode": "value",
+        "colorMode": "none",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "Unknown"
+        },
+        "overrides": []
+      },
+      "id": 9,
+      "gridPos": {
+        "x": 6,
+        "y": 15,
+        "w": 3,
+        "h": 4
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Members",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "demo_members{run_id=\"$run_id\",mode=\"classic\"}",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "time_series"
+        }
+      ],
+      "options": {
+        "textMode": "value",
+        "colorMode": "none",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "Unknown"
+        },
+        "overrides": []
+      },
+      "id": 10,
+      "gridPos": {
+        "x": 9,
+        "y": 15,
+        "w": 3,
+        "h": 4
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Verified / sec",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(demo_verified_total{run_id=\"$run_id\",mode=\"share\"}[30s]))",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "time_series"
+        }
+      ],
+      "options": {
+        "textMode": "value",
+        "colorMode": "none",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "noValue": "Unknown"
+        },
+        "overrides": []
+      },
+      "id": 11,
+      "gridPos": {
+        "x": 12,
+        "y": 15,
+        "w": 3,
+        "h": 4
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Unfinished",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(demo_unfinished{run_id=\"$run_id\",mode=\"share\"})",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "time_series"
+        }
+      ],
+      "options": {
+        "textMode": "value",
+        "colorMode": "none",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "Unknown"
+        },
+        "overrides": []
+      },
+      "id": 12,
+      "gridPos": {
+        "x": 15,
+        "y": 15,
+        "w": 3,
+        "h": 4
+      }
+    },
+    {
+      "type": "stat",
+      "title": "E2E p95",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95,sum by (le) (rate(demo_e2e_seconds_bucket{run_id=\"$run_id\",mode=\"share\"}[30s])))",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "time_series"
+        }
+      ],
+      "options": {
+        "textMode": "value",
+        "colorMode": "none",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "Unknown"
+        },
+        "overrides": []
+      },
+      "id": 13,
+      "gridPos": {
+        "x": 18,
+        "y": 15,
+        "w": 3,
+        "h": 4
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Members",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "demo_members{run_id=\"$run_id\",mode=\"share\"}",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "time_series"
+        }
+      ],
+      "options": {
+        "textMode": "value",
+        "colorMode": "none",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "Unknown"
+        },
+        "overrides": []
+      },
+      "id": 14,
+      "gridPos": {
+        "x": 21,
+        "y": 15,
+        "w": 3,
+        "h": 4
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Verified unique results / second - ordinary",
+      "description": "First correct output for each job ID, independently observed at the destination. Duplicates do not increase useful throughput.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(demo_verified_total{run_id=\"$run_id\",mode=\"classic\"}[30s]))",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "clamp_min(max(max_over_time((sum(rate(demo_verified_total{run_id=\"$run_id\",mode=~\"classic|share\"}[30s])))[$__range:5s])) * 1.1, 1)",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "configFromData",
+          "options": {
+            "configRefId": "B",
+            "applyTo": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "mappings": [
+              {
+                "fieldName": "Value",
+                "handlerKey": "max"
+              }
+            ]
+          }
+        },
+        {
+          "id": "filterByRefId",
+          "options": {
+            "include": "A"
+          }
+        }
+      ],
+      "id": 15,
+      "gridPos": {
+        "x": 0,
+        "y": 19,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Verified unique results / second - share",
+      "description": "First correct output for each job ID, independently observed at the destination. Duplicates do not increase useful throughput.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(demo_verified_total{run_id=\"$run_id\",mode=\"share\"}[30s]))",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "clamp_min(max(max_over_time((sum(rate(demo_verified_total{run_id=\"$run_id\",mode=~\"classic|share\"}[30s])))[$__range:5s])) * 1.1, 1)",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "configFromData",
+          "options": {
+            "configRefId": "B",
+            "applyTo": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "mappings": [
+              {
+                "fieldName": "Value",
+                "handlerKey": "max"
+              }
+            ]
+          }
+        },
+        {
+          "id": "filterByRefId",
+          "options": {
+            "include": "A"
+          }
+        }
+      ],
+      "id": 16,
+      "gridPos": {
+        "x": 12,
+        "y": 19,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Tasks completing useful work in 30 seconds - ordinary",
+      "description": "Participation over a window; this does not prove those tasks ran simultaneously.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          },
+          "max": 9
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(sum by (task) (rate(demo_verified_total{run_id=\"$run_id\",mode=\"classic\"}[30s])) > 0)",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        }
+      ],
+      "id": 17,
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Tasks completing useful work in 30 seconds - share",
+      "description": "Participation over a window; this does not prove those tasks ran simultaneously.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          },
+          "max": 9
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(sum by (task) (rate(demo_verified_total{run_id=\"$run_id\",mode=\"share\"}[30s])) > 0)",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        }
+      ],
+      "id": 18,
+      "gridPos": {
+        "x": 12,
+        "y": 26,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Sampled concurrent processing tasks - ordinary",
+      "description": "Scraped work-in-progress gauges, including the awaited destination write. Failed scrape targets are excluded. Use the full-run processing-span overlap report for a stronger concurrency check.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          },
+          "max": 9
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(demo_task_processing{run_id=\"$run_id\",mode=\"classic\"} and on (job, instance) (up{job=\"connect-tasks\"} == 1))",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        }
+      ],
+      "id": 19,
+      "gridPos": {
+        "x": 0,
+        "y": 33,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Sampled concurrent processing tasks - share",
+      "description": "Scraped work-in-progress gauges, including the awaited destination write. Failed scrape targets are excluded. Use the full-run processing-span overlap report for a stronger concurrency check.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          },
+          "max": 9
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(demo_task_processing{run_id=\"$run_id\",mode=\"share\"} and on (job, instance) (up{job=\"connect-tasks\"} == 1))",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        }
+      ],
+      "id": 20,
+      "gridPos": {
+        "x": 12,
+        "y": 33,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Verified result rate by task - ordinary",
+      "description": "Original task IDs from verified audit records. No completed output means no series; this does not by itself mean a task failed.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (task) (rate(demo_verified_total{run_id=\"$run_id\",mode=\"classic\"}[30s]))",
+          "legendFormat": "Task {{task}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "clamp_min(max(max_over_time((sum by (task) (rate(demo_verified_total{run_id=\"$run_id\",mode=~\"classic|share\"}[30s])))[$__range:5s])) * 1.1, 1)",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "configFromData",
+          "options": {
+            "configRefId": "B",
+            "applyTo": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "mappings": [
+              {
+                "fieldName": "Value",
+                "handlerKey": "max"
+              }
+            ]
+          }
+        },
+        {
+          "id": "filterByRefId",
+          "options": {
+            "include": "A"
+          }
+        }
+      ],
+      "id": 21,
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Verified result rate by task - share",
+      "description": "Original task IDs from verified audit records. No completed output means no series; this does not by itself mean a task failed.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (task) (rate(demo_verified_total{run_id=\"$run_id\",mode=\"share\"}[30s]))",
+          "legendFormat": "Task {{task}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "clamp_min(max(max_over_time((sum by (task) (rate(demo_verified_total{run_id=\"$run_id\",mode=~\"classic|share\"}[30s])))[$__range:5s])) * 1.1, 1)",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "configFromData",
+          "options": {
+            "configRefId": "B",
+            "applyTo": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "mappings": [
+              {
+                "fieldName": "Value",
+                "handlerKey": "max"
+              }
+            ]
+          }
+        },
+        {
+          "id": "filterByRefId",
+          "options": {
+            "include": "A"
+          }
+        }
+      ],
+      "id": 22,
+      "gridPos": {
+        "x": 12,
+        "y": 40,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "table",
+      "title": "Task x input partition - ordinary",
+      "description": "Verified unique results over the last 30 seconds. Cell shading shows actual work from each original input partition. Blank cells mean no observed series, not fabricated zeros.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (task, partition) (increase(demo_verified_total{run_id=\"$run_id\",mode=\"classic\"}[30s]))",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "groupingToMatrix",
+          "options": {
+            "columnField": "partition",
+            "rowField": "task",
+            "valueField": "Value",
+            "emptyValue": "null"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 1,
+          "noValue": "",
+          "color": {
+            "mode": "continuous-BlYlRd"
+          },
+          "custom": {
+            "cellOptions": {
+              "type": "color-background",
+              "mode": "gradient"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byType",
+              "options": "string"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "auto"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false
+        }
+      },
+      "id": 23,
+      "gridPos": {
+        "x": 0,
+        "y": 47,
+        "w": 12,
+        "h": 8
+      }
+    },
+    {
+      "type": "table",
+      "title": "Task x input partition - share",
+      "description": "Verified unique results over the last 30 seconds. Cell shading shows actual work from each original input partition. Blank cells mean no observed series, not fabricated zeros.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (task, partition) (increase(demo_verified_total{run_id=\"$run_id\",mode=\"share\"}[30s]))",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "groupingToMatrix",
+          "options": {
+            "columnField": "partition",
+            "rowField": "task",
+            "valueField": "Value",
+            "emptyValue": "null"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 1,
+          "noValue": "",
+          "color": {
+            "mode": "continuous-BlYlRd"
+          },
+          "custom": {
+            "cellOptions": {
+              "type": "color-background",
+              "mode": "gradient"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byType",
+              "options": "string"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "auto"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false
+        }
+      },
+      "id": 24,
+      "gridPos": {
+        "x": 12,
+        "y": 47,
+        "w": 12,
+        "h": 8
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Who completes hot P0 records? - ordinary",
+      "description": "Actual P0 completion by task, separate from eligibility to fetch P0.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (task) (rate(demo_verified_total{run_id=\"$run_id\",mode=\"classic\",partition=\"0\"}[30s]))",
+          "legendFormat": "Task {{task}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "clamp_min(max(max_over_time((sum by (task) (rate(demo_verified_total{run_id=\"$run_id\",mode=~\"classic|share\",partition=\"0\"}[30s])))[$__range:5s])) * 1.1, 1)",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "configFromData",
+          "options": {
+            "configRefId": "B",
+            "applyTo": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "mappings": [
+              {
+                "fieldName": "Value",
+                "handlerKey": "max"
+              }
+            ]
+          }
+        },
+        {
+          "id": "filterByRefId",
+          "options": {
+            "include": "A"
+          }
+        }
+      ],
+      "id": 25,
+      "gridPos": {
+        "x": 0,
+        "y": 55,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Who completes hot P0 records? - share",
+      "description": "Actual P0 completion by task, separate from eligibility to fetch P0.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (task) (rate(demo_verified_total{run_id=\"$run_id\",mode=\"share\",partition=\"0\"}[30s]))",
+          "legendFormat": "Task {{task}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "clamp_min(max(max_over_time((sum by (task) (rate(demo_verified_total{run_id=\"$run_id\",mode=~\"classic|share\",partition=\"0\"}[30s])))[$__range:5s])) * 1.1, 1)",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "configFromData",
+          "options": {
+            "configRefId": "B",
+            "applyTo": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "mappings": [
+              {
+                "fieldName": "Value",
+                "handlerKey": "max"
+              }
+            ]
+          }
+        },
+        {
+          "id": "filterByRefId",
+          "options": {
+            "include": "A"
+          }
+        }
+      ],
+      "id": 26,
+      "gridPos": {
+        "x": 12,
+        "y": 55,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Verified result rate by input partition - ordinary",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (partition) (rate(demo_verified_total{run_id=\"$run_id\",mode=\"classic\"}[30s]))",
+          "legendFormat": "P{{partition}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "clamp_min(max(max_over_time((sum by (partition) (rate(demo_verified_total{run_id=\"$run_id\",mode=~\"classic|share\"}[30s])))[$__range:5s])) * 1.1, 1)",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "configFromData",
+          "options": {
+            "configRefId": "B",
+            "applyTo": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "mappings": [
+              {
+                "fieldName": "Value",
+                "handlerKey": "max"
+              }
+            ]
+          }
+        },
+        {
+          "id": "filterByRefId",
+          "options": {
+            "include": "A"
+          }
+        }
+      ],
+      "id": 27,
+      "gridPos": {
+        "x": 0,
+        "y": 62,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Verified result rate by input partition - share",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (partition) (rate(demo_verified_total{run_id=\"$run_id\",mode=\"share\"}[30s]))",
+          "legendFormat": "P{{partition}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "clamp_min(max(max_over_time((sum by (partition) (rate(demo_verified_total{run_id=\"$run_id\",mode=~\"classic|share\"}[30s])))[$__range:5s])) * 1.1, 1)",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "configFromData",
+          "options": {
+            "configRefId": "B",
+            "applyTo": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "mappings": [
+              {
+                "fieldName": "Value",
+                "handlerKey": "max"
+              }
+            ]
+          }
+        },
+        {
+          "id": "filterByRefId",
+          "options": {
+            "include": "A"
+          }
+        }
+      ],
+      "id": 28,
+      "gridPos": {
+        "x": 12,
+        "y": 62,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Unfinished jobs by input partition - ordinary",
+      "description": "Successfully published unique jobs minus correct unique outputs. This is comparable business backlog, not native source lag.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (partition) (demo_unfinished{run_id=\"$run_id\",mode=\"classic\"})",
+          "legendFormat": "P{{partition}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "clamp_min(max(max_over_time((sum by (partition) (demo_unfinished{run_id=\"$run_id\",mode=~\"classic|share\"}))[$__range:5s])) * 1.1, 1)",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "configFromData",
+          "options": {
+            "configRefId": "B",
+            "applyTo": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "mappings": [
+              {
+                "fieldName": "Value",
+                "handlerKey": "max"
+              }
+            ]
+          }
+        },
+        {
+          "id": "filterByRefId",
+          "options": {
+            "include": "A"
+          }
+        }
+      ],
+      "id": 29,
+      "gridPos": {
+        "x": 0,
+        "y": 69,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Unfinished jobs by input partition - share",
+      "description": "Successfully published unique jobs minus correct unique outputs. This is comparable business backlog, not native source lag.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (partition) (demo_unfinished{run_id=\"$run_id\",mode=\"share\"})",
+          "legendFormat": "P{{partition}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "clamp_min(max(max_over_time((sum by (partition) (demo_unfinished{run_id=\"$run_id\",mode=~\"classic|share\"}))[$__range:5s])) * 1.1, 1)",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "configFromData",
+          "options": {
+            "configRefId": "B",
+            "applyTo": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "mappings": [
+              {
+                "fieldName": "Value",
+                "handlerKey": "max"
+              }
+            ]
+          }
+        },
+        {
+          "id": "filterByRefId",
+          "options": {
+            "include": "A"
+          }
+        }
+      ],
+      "id": 30,
+      "gridPos": {
+        "x": 12,
+        "y": 69,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "End-to-end completion latency - ordinary",
+      "description": "Input publication timestamp to first correct output observation. Rolling histogram estimates include completed jobs only. Read with unfinished count and oldest unfinished age; exact full-run values are in the saved report.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5,sum by (le) (rate(demo_e2e_seconds_bucket{run_id=\"$run_id\",mode=\"classic\"}[30s])))",
+          "legendFormat": "p50",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95,sum by (le) (rate(demo_e2e_seconds_bucket{run_id=\"$run_id\",mode=\"classic\"}[30s])))",
+          "legendFormat": "p95",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99,sum by (le) (rate(demo_e2e_seconds_bucket{run_id=\"$run_id\",mode=\"classic\"}[30s])))",
+          "legendFormat": "p99",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        },
+        {
+          "refId": "D",
+          "expr": "clamp_min(max(max_over_time((histogram_quantile(0.99,sum by (mode,le) (rate(demo_e2e_seconds_bucket{run_id=\"$run_id\"}[30s]))))[$__range:5s])) * 1.1, 0.1)",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "configFromData",
+          "options": {
+            "configRefId": "D",
+            "applyTo": {
+              "id": "byFrameRefID",
+              "options": "A|B|C"
+            },
+            "mappings": [
+              {
+                "fieldName": "Value",
+                "handlerKey": "max"
+              }
+            ]
+          }
+        },
+        {
+          "id": "filterByRefId",
+          "options": {
+            "include": "A|B|C"
+          }
+        }
+      ],
+      "id": 31,
+      "gridPos": {
+        "x": 0,
+        "y": 76,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "End-to-end completion latency - share",
+      "description": "Input publication timestamp to first correct output observation. Rolling histogram estimates include completed jobs only. Read with unfinished count and oldest unfinished age; exact full-run values are in the saved report.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5,sum by (le) (rate(demo_e2e_seconds_bucket{run_id=\"$run_id\",mode=\"share\"}[30s])))",
+          "legendFormat": "p50",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95,sum by (le) (rate(demo_e2e_seconds_bucket{run_id=\"$run_id\",mode=\"share\"}[30s])))",
+          "legendFormat": "p95",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99,sum by (le) (rate(demo_e2e_seconds_bucket{run_id=\"$run_id\",mode=\"share\"}[30s])))",
+          "legendFormat": "p99",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        },
+        {
+          "refId": "D",
+          "expr": "clamp_min(max(max_over_time((histogram_quantile(0.99,sum by (mode,le) (rate(demo_e2e_seconds_bucket{run_id=\"$run_id\"}[30s]))))[$__range:5s])) * 1.1, 0.1)",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "configFromData",
+          "options": {
+            "configRefId": "D",
+            "applyTo": {
+              "id": "byFrameRefID",
+              "options": "A|B|C"
+            },
+            "mappings": [
+              {
+                "fieldName": "Value",
+                "handlerKey": "max"
+              }
+            ]
+          }
+        },
+        {
+          "id": "filterByRefId",
+          "options": {
+            "include": "A|B|C"
+          }
+        }
+      ],
+      "id": 32,
+      "gridPos": {
+        "x": 12,
+        "y": 76,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Oldest unfinished job age - ordinary",
+      "description": "Age of the oldest successfully published job without a verified correct output. This exposes work absent from completion histograms.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(demo_oldest_unfinished_seconds{run_id=\"$run_id\",mode=\"classic\"})",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "clamp_min(max(max_over_time((max(demo_oldest_unfinished_seconds{run_id=\"$run_id\",mode=~\"classic|share\"}))[$__range:5s])) * 1.1, 1)",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "configFromData",
+          "options": {
+            "configRefId": "B",
+            "applyTo": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "mappings": [
+              {
+                "fieldName": "Value",
+                "handlerKey": "max"
+              }
+            ]
+          }
+        },
+        {
+          "id": "filterByRefId",
+          "options": {
+            "include": "A"
+          }
+        }
+      ],
+      "id": 33,
+      "gridPos": {
+        "x": 0,
+        "y": 83,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Oldest unfinished job age - share",
+      "description": "Age of the oldest successfully published job without a verified correct output. This exposes work absent from completion histograms.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(demo_oldest_unfinished_seconds{run_id=\"$run_id\",mode=\"share\"})",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "clamp_min(max(max_over_time((max(demo_oldest_unfinished_seconds{run_id=\"$run_id\",mode=~\"classic|share\"}))[$__range:5s])) * 1.1, 1)",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "configFromData",
+          "options": {
+            "configRefId": "B",
+            "applyTo": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "mappings": [
+              {
+                "fieldName": "Value",
+                "handlerKey": "max"
+              }
+            ]
+          }
+        },
+        {
+          "id": "filterByRefId",
+          "options": {
+            "include": "A"
+          }
+        }
+      ],
+      "id": 34,
+      "gridPos": {
+        "x": 12,
+        "y": 83,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Committed-offset lag",
+      "description": "Native Admin API measurement. These source-progress measures have different semantics; compare business backlog above. Unavailable share lag is omitted, never replaced with zero.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "demo_source_lag{run_id=\"$run_id\",mode=\"classic\"}",
+          "legendFormat": "P{{partition}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        }
+      ],
+      "id": 35,
+      "gridPos": {
+        "x": 0,
+        "y": 90,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Native share lag",
+      "description": "Native Admin API measurement. These source-progress measures have different semantics; compare business backlog above. Unavailable share lag is omitted, never replaced with zero.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "demo_source_lag{run_id=\"$run_id\",mode=\"share\"}",
+          "legendFormat": "P{{partition}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        }
+      ],
+      "id": 36,
+      "gridPos": {
+        "x": 12,
+        "y": 90,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Joined group members - ordinary",
+      "description": "Membership does not prove partition assignment or processing activity.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          },
+          "max": 9
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "demo_members{run_id=\"$run_id\",mode=\"classic\"}",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        }
+      ],
+      "id": 37,
+      "gridPos": {
+        "x": 0,
+        "y": 97,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Joined group members - share",
+      "description": "Membership does not prove partition assignment or processing activity.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          },
+          "max": 9
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "demo_members{run_id=\"$run_id\",mode=\"share\"}",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        }
+      ],
+      "id": 38,
+      "gridPos": {
+        "x": 12,
+        "y": 97,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Eligible members per partition - ordinary",
+      "description": "Ordinary assignments are exclusive. Share eligibility follows the broker assignor; default simple gives three per partition for 9 members / 3 partitions.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          },
+          "max": 9
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "demo_partition_eligible_members{run_id=\"$run_id\",mode=\"classic\"}",
+          "legendFormat": "P{{partition}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        }
+      ],
+      "id": 39,
+      "gridPos": {
+        "x": 0,
+        "y": 104,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Eligible members per partition - share",
+      "description": "Ordinary assignments are exclusive. Share eligibility follows the broker assignor; default simple gives three per partition for 9 members / 3 partitions.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          },
+          "max": 9
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "demo_partition_eligible_members{run_id=\"$run_id\",mode=\"share\"}",
+          "legendFormat": "P{{partition}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        }
+      ],
+      "id": 40,
+      "gridPos": {
+        "x": 12,
+        "y": 104,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Share acquisitions in flight",
+      "description": "Broker acquisition state. In-flight records are not the same as executing jobs or all unfinished work.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "kafka_share_inflight_records{group=\"demo-share-$run_id\"}",
+          "legendFormat": "P{{partition}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        }
+      ],
+      "id": 41,
+      "gridPos": {
+        "x": 0,
+        "y": 111,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Share acquisition-lock timeouts / second",
+      "description": "Broker record-lease expirations for this share group. Read alongside renewals and processing deadlines.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(kafka_share_lock_timeouts_total{group=\"demo-share-$run_id\"}[30s])",
+          "legendFormat": "P{{partition}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        }
+      ],
+      "id": 42,
+      "gridPos": {
+        "x": 12,
+        "y": 111,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Share acknowledgements / second - broker-wide",
+      "description": "Broker-wide Accept/Release/Reject/Renew activity, not a per-task completion count. Renewal is not useful output.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (ack_type) (rate(kafka_share_acknowledgements_total[30s]))",
+          "legendFormat": "{{ack_type}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        }
+      ],
+      "id": 43,
+      "gridPos": {
+        "x": 0,
+        "y": 118,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Admin collector health",
+      "description": "One means the latest native group query succeeded. Missing or failed native data is not interpreted as zero lag.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          },
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "demo_admin_ok{run_id=\"$run_id\"}",
+          "legendFormat": "{{mode}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        }
+      ],
+      "id": 44,
+      "gridPos": {
+        "x": 12,
+        "y": 118,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "JVM process CPU fraction - ordinary",
+      "description": "Raw OperatingSystem ProcessCpuLoad fraction. This is not CPU divided by the pod quota.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          },
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "demo_jvm_process_cpu_ratio{mode=\"classic\"}",
+          "legendFormat": "{{worker}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        }
+      ],
+      "id": 45,
+      "gridPos": {
+        "x": 0,
+        "y": 125,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "JVM process CPU fraction - share",
+      "description": "Raw OperatingSystem ProcessCpuLoad fraction. This is not CPU divided by the pod quota.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          },
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "demo_jvm_process_cpu_ratio{mode=\"share\"}",
+          "legendFormat": "{{worker}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        }
+      ],
+      "id": 46,
+      "gridPos": {
+        "x": 12,
+        "y": 125,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "JVM heap usage / maximum - ordinary",
+      "description": "JVM heap only. Native memory and container page cache are not included.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          },
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "demo_jvm_heap_used_bytes{mode=\"classic\"} / demo_jvm_heap_max_bytes{mode=\"classic\"}",
+          "legendFormat": "{{worker}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        }
+      ],
+      "id": 47,
+      "gridPos": {
+        "x": 0,
+        "y": 132,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "JVM heap usage / maximum - share",
+      "description": "JVM heap only. Native memory and container page cache are not included.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          },
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "demo_jvm_heap_used_bytes{mode=\"share\"} / demo_jvm_heap_max_bytes{mode=\"share\"}",
+          "legendFormat": "{{worker}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        }
+      ],
+      "id": 48,
+      "gridPos": {
+        "x": 12,
+        "y": 132,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Duplicate physical output occurrences - ordinary",
+      "description": "Additional physical output occurrences of an input identity. At-least-once recovery can produce duplicates; they remain visible.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "demo_duplicates_total{run_id=\"$run_id\",mode=\"classic\"}",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "clamp_min(max(max_over_time((demo_duplicates_total{run_id=\"$run_id\",mode=~\"classic|share\"})[$__range:5s])) * 1.1, 1)",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "configFromData",
+          "options": {
+            "configRefId": "B",
+            "applyTo": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "mappings": [
+              {
+                "fieldName": "Value",
+                "handlerKey": "max"
+              }
+            ]
+          }
+        },
+        {
+          "id": "filterByRefId",
+          "options": {
+            "include": "A"
+          }
+        }
+      ],
+      "id": 49,
+      "gridPos": {
+        "x": 0,
+        "y": 139,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Duplicate physical output occurrences - share",
+      "description": "Additional physical output occurrences of an input identity. At-least-once recovery can produce duplicates; they remain visible.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "demo_duplicates_total{run_id=\"$run_id\",mode=\"share\"}",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "clamp_min(max(max_over_time((demo_duplicates_total{run_id=\"$run_id\",mode=~\"classic|share\"})[$__range:5s])) * 1.1, 1)",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "configFromData",
+          "options": {
+            "configRefId": "B",
+            "applyTo": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "mappings": [
+              {
+                "fieldName": "Value",
+                "handlerKey": "max"
+              }
+            ]
+          }
+        },
+        {
+          "id": "filterByRefId",
+          "options": {
+            "include": "A"
+          }
+        }
+      ],
+      "id": 50,
+      "gridPos": {
+        "x": 12,
+        "y": 139,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Invalid / unexpected output occurrences - ordinary",
+      "description": "Wrong payload, result or identity. A successful run must not hide these behind deduplication.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "demo_invalid_total{run_id=\"$run_id\",mode=\"classic\"}",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "clamp_min(max(max_over_time((demo_invalid_total{run_id=\"$run_id\",mode=~\"classic|share\"})[$__range:5s])) * 1.1, 1)",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "configFromData",
+          "options": {
+            "configRefId": "B",
+            "applyTo": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "mappings": [
+              {
+                "fieldName": "Value",
+                "handlerKey": "max"
+              }
+            ]
+          }
+        },
+        {
+          "id": "filterByRefId",
+          "options": {
+            "include": "A"
+          }
+        }
+      ],
+      "id": 51,
+      "gridPos": {
+        "x": 0,
+        "y": 146,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Invalid / unexpected output occurrences - share",
+      "description": "Wrong payload, result or identity. A successful run must not hide these behind deduplication.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "demo_invalid_total{run_id=\"$run_id\",mode=\"share\"}",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "clamp_min(max(max_over_time((demo_invalid_total{run_id=\"$run_id\",mode=~\"classic|share\"})[$__range:5s])) * 1.1, 1)",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "configFromData",
+          "options": {
+            "configRefId": "B",
+            "applyTo": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "mappings": [
+              {
+                "fieldName": "Value",
+                "handlerKey": "max"
+              }
+            ]
+          }
+        },
+        {
+          "id": "filterByRefId",
+          "options": {
+            "include": "A"
+          }
+        }
+      ],
+      "id": 52,
+      "gridPos": {
+        "x": 12,
+        "y": 146,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Task processing failures / second - ordinary",
+      "description": "Plugin failures. Retry/write attempts are separate from verified unique completion.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(demo_task_failures_total{run_id=\"$run_id\",mode=\"classic\"}[30s]))",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "clamp_min(max(max_over_time((sum(rate(demo_task_failures_total{run_id=\"$run_id\",mode=~\"classic|share\"}[30s])))[$__range:5s])) * 1.1, 1)",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "configFromData",
+          "options": {
+            "configRefId": "B",
+            "applyTo": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "mappings": [
+              {
+                "fieldName": "Value",
+                "handlerKey": "max"
+              }
+            ]
+          }
+        },
+        {
+          "id": "filterByRefId",
+          "options": {
+            "include": "A"
+          }
+        }
+      ],
+      "id": 53,
+      "gridPos": {
+        "x": 0,
+        "y": 153,
+        "w": 12,
+        "h": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Task processing failures / second - share",
+      "description": "Plugin failures. Retry/write attempts are separate from verified unique completion.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "demo-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "axisBorderShow": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(demo_task_failures_total{run_id=\"$run_id\",mode=\"share\"}[30s]))",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "clamp_min(max(max_over_time((sum(rate(demo_task_failures_total{run_id=\"$run_id\",mode=~\"classic|share\"}[30s])))[$__range:5s])) * 1.1, 1)",
+          "legendFormat": "",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "demo-prom"
+          },
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "configFromData",
+          "options": {
+            "configRefId": "B",
+            "applyTo": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "mappings": [
+              {
+                "fieldName": "Value",
+                "handlerKey": "max"
+              }
+            ]
+          }
+        },
+        {
+          "id": "filterByRefId",
+          "options": {
+            "include": "A"
+          }
+        }
+      ],
+      "id": 54,
+      "gridPos": {
+        "x": 12,
+        "y": 153,
+        "w": 12,
+        "h": 7
+      }
+    }
+  ]
+}

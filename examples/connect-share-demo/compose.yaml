@@ -1,0 +1,140 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License. You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: kafka-connect-share-demo
+
+x-connect: &connect
+  image: kafka-connect-share-demo:local
+  command: [connect]
+  cpus: 1.0
+  mem_limit: 768m
+  depends_on:
+    broker: {condition: service_healthy}
+  stop_grace_period: 30s
+  healthcheck:
+    test: [CMD, bash, -c, 'exec 3<>/dev/tcp/127.0.0.1/8083']
+    interval: 5s
+    timeout: 3s
+    retries: 30
+
+services:
+  broker:
+    image: kafka-connect-share-demo:local
+    build: ./build/image
+    command: [broker]
+    cpus: 2.0
+    mem_limit: 1536m
+    environment:
+      KAFKA_HEAP_OPTS: -Xms512m -Xmx768m
+      SHARE_ASSIGNOR: ${SHARE_ASSIGNOR:-simple}
+    ports: ['127.0.0.1:19092:19092']
+    volumes: [broker-data:/var/lib/kafka/data]
+    healthcheck:
+      test: [CMD, bash, -c, '/opt/kafka/bin/kafka-topics.sh --bootstrap-server broker:9092 --list >/dev/null']
+      interval: 10s
+      timeout: 10s
+      retries: 20
+
+  classic-1:
+    <<: *connect
+    hostname: classic-1
+    environment: {MODE: classic, WORKER_HOST: classic-1, KAFKA_HEAP_OPTS: '-Xms128m -Xmx384m'}
+    ports: ['127.0.0.1:8083:8083']
+  classic-2:
+    <<: *connect
+    hostname: classic-2
+    environment: {MODE: classic, WORKER_HOST: classic-2, KAFKA_HEAP_OPTS: '-Xms128m -Xmx384m'}
+  classic-3:
+    <<: *connect
+    hostname: classic-3
+    environment: {MODE: classic, WORKER_HOST: classic-3, KAFKA_HEAP_OPTS: '-Xms128m -Xmx384m'}
+  share-1:
+    <<: *connect
+    hostname: share-1
+    environment: {MODE: share, WORKER_HOST: share-1, KAFKA_HEAP_OPTS: '-Xms128m -Xmx384m'}
+    ports: ['127.0.0.1:8084:8083']
+  share-2:
+    <<: *connect
+    hostname: share-2
+    environment: {MODE: share, WORKER_HOST: share-2, KAFKA_HEAP_OPTS: '-Xms128m -Xmx384m'}
+  share-3:
+    <<: *connect
+    hostname: share-3
+    environment: {MODE: share, WORKER_HOST: share-3, KAFKA_HEAP_OPTS: '-Xms128m -Xmx384m'}
+
+  control:
+    image: kafka-connect-share-demo:local
+    command: [control]
+    cpus: 1.0
+    mem_limit: 1024m
+    environment:
+      BOOTSTRAP_SERVERS: broker:9092
+      CLASSIC_CONNECT: http://classic-1:8083
+      SHARE_CONNECT: http://share-1:8083
+      DATA_DIR: /data
+      SHARE_POLICY: ${SHARE_ASSIGNOR:-simple}
+    ports: ['127.0.0.1:8090:8090']
+    volumes: [control-data:/data]
+    depends_on:
+      classic-1: {condition: service_healthy}
+      classic-2: {condition: service_healthy}
+      classic-3: {condition: service_healthy}
+      share-1: {condition: service_healthy}
+      share-2: {condition: service_healthy}
+      share-3: {condition: service_healthy}
+
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    command: ['--config.file=/etc/prometheus/prometheus.yaml', '--storage.tsdb.retention.time=6h', '--storage.tsdb.retention.size=512MB']
+    mem_limit: 512m
+    ports: ['127.0.0.1:9090:9090']
+    volumes:
+      - ./config/prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    mem_limit: 384m
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: 'true'
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_DISABLE_LOGIN_FORM: 'true'
+      GF_ANALYTICS_REPORTING_ENABLED: 'false'
+    ports: ['127.0.0.1:3000:3000']
+    volumes:
+      - ./dashboard/datasource.yaml:/etc/grafana/provisioning/datasources/demo.yaml:ro
+      - ./dashboard/provider.yaml:/etc/grafana/provisioning/dashboards/demo.yaml:ro
+      - ./dashboard/dashboard.json:/var/lib/grafana/dashboards/demo.json:ro
+    depends_on: [prometheus]
+
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:v1.5.0
+    mem_limit: 512m
+    environment:
+      KAFKA_CLUSTERS_0_NAME: connect-share-demo
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: broker:9092
+      KAFKA_CLUSTERS_0_READONLY: 'true'
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: classic
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://classic-1:8083
+      KAFKA_CLUSTERS_0_KAFKACONNECT_1_NAME: share
+      KAFKA_CLUSTERS_0_KAFKACONNECT_1_ADDRESS: http://share-1:8083
+    ports: ['127.0.0.1:8080:8080']
+    depends_on:
+      broker: {condition: service_healthy}
+
+volumes:
+  broker-data:
+  control-data:
+  prometheus-data:
