@@ -138,6 +138,7 @@ import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.AdditionalMatchers.leq;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -3233,6 +3234,192 @@ public class DistributedHerderTest {
         verify(member, times(2)).ensureActive(any());
         verify(member, times(1)).poll(anyLong(), any());
         verify(configBackingStore, times(1)).putSessionKey(any(SessionKey.class));
+    }
+
+    @Test
+    public void testTransactionalShareSinkStartupUsesFencedWorker() {
+        ClusterConfigState snapshot = transactionalShareSnapshot(1, 1, false, TargetState.STARTED);
+        configureTransactionalShareHerder(snapshot, true, List.of(TASK0));
+        ArgumentCaptor<Runnable> preProducer = ArgumentCaptor.forClass(Runnable.class);
+        ArgumentCaptor<Runnable> postProducer = ArgumentCaptor.forClass(Runnable.class);
+        when(worker.startTransactionalShareSinkTask(eq(TASK0), eq(snapshot), anyMap(), anyMap(), eq(herder),
+            eq(TargetState.STARTED), preProducer.capture(), postProducer.capture())).thenReturn(true);
+        doAnswer(invocation -> {
+            Callback<Void> callback = invocation.getArgument(1);
+            callback.onCompletion(null, null);
+            return null;
+        }).when(herder).fenceZombieSourceTasks(eq(TASK0), any());
+
+        herder.tick();
+        preProducer.getValue().run();
+
+        verify(herder).fenceZombieSourceTasks(eq(TASK0), any());
+        assertEquals(1, postProducer.getAllValues().size());
+        Callback<Void> callback = mock(Callback.class);
+        herder.verifyTaskGenerationAndOwnership(TASK0, 5, callback);
+        verify(callback).onCompletion(null, null);
+        assertThrows(ConnectException.class, () -> herder.verifyTaskGenerationAndOwnership(TASK0, 4, callback));
+        assertThrows(ConnectException.class, () -> herder.verifyTaskGenerationAndOwnership(TASK1, 5, callback));
+        verify(worker, times(0)).startSinkTask(any(), any(), any(), any(), any(), any());
+        verify(worker, times(0)).startExactlyOnceSourceTask(any(), any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    public void testTransactionalShareSinkRequiresConfigTopicFencing() {
+        configureTransactionalShareHerder(transactionalShareSnapshot(1, null, false, TargetState.STARTED), false, List.of(TASK0));
+        herder.tick();
+        verify(herder).onFailure(eq(TASK0), any(ConnectException.class));
+        verify(worker, times(0)).startTransactionalShareSinkTask(any(), any(), any(), any(), any(), any(), any(), any());
+        verify(worker, times(0)).startSinkTask(any(), any(), any(), any(), any(), any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 1, 3})
+    public void testTransactionalShareSinkFencesPreviousTaskCount(int taskCount) {
+        ClusterConfigState snapshot = transactionalShareSnapshot(taskCount, 3, true,
+            taskCount == 0 ? TargetState.STOPPED : TargetState.STARTED);
+        configureTransactionalShareHerder(snapshot, true, List.of());
+        KafkaFuture<Void> workerFuture = mock(KafkaFuture.class);
+        KafkaFuture<Void> herderFuture = mock(KafkaFuture.class);
+        ArgumentCaptor<KafkaFuture.BaseFunction<Void, Void>> followup = ArgumentCaptor.forClass(KafkaFuture.BaseFunction.class);
+        when(worker.fenceZombies(CONN1, 3, snapshot.connectorConfig(CONN1))).thenReturn(workerFuture);
+        when(workerFuture.thenApply(followup.capture())).thenReturn(herderFuture);
+        doAnswer(invocation -> {
+            Callable<Void> operation = invocation.getArgument(0);
+            Callback<Void> callback = invocation.getArgument(1);
+            callback.onCompletion(null, operation.call());
+            return null;
+        }).when(herder).runOnTickThread(any(), any());
+        if (taskCount > 0) herder.fenceZombieSourceTasks(CONN1, new FutureCallback<>());
+
+        herder.tick();
+
+        verify(worker).fenceZombies(CONN1, 3, snapshot.connectorConfig(CONN1));
+        verify(configBackingStore, times(0)).putTaskCountRecord(anyString(), anyInt());
+        followup.getValue().apply(null);
+        verify(configBackingStore).putTaskCountRecord(CONN1, taskCount);
+    }
+
+    @Test
+    public void testTransactionalShareSinkNeverStartedCanBeDeleted() throws Exception {
+        configureTransactionalShareHerder(transactionalShareSnapshot(0, null, false, TargetState.STOPPED), true, List.of());
+        FutureCallback<Herder.Created<ConnectorInfo>> callback = new FutureCallback<>();
+        herder.deleteConnectorConfig(CONN1, callback);
+        herder.tick();
+        assertFalse(callback.get(1, TimeUnit.SECONDS).created());
+        verify(configBackingStore).removeConnectorConfig(CONN1);
+        verify(worker, times(0)).fenceZombies(anyString(), anyInt(), anyMap());
+    }
+
+    @Test
+    public void testTransactionalShareSinkCannotForgetLiveTaskHistory() throws Exception {
+        configureTransactionalShareHerder(transactionalShareSnapshot(1, 3, false, TargetState.STARTED), true, List.of());
+        FutureCallback<Herder.Created<ConnectorInfo>> callback = new FutureCallback<>();
+        herder.deleteConnectorConfig(CONN1, callback);
+        herder.tick();
+        ExecutionException error = assertThrows(ExecutionException.class, () -> callback.get(1, TimeUnit.SECONDS));
+        assertInstanceOf(BadRequestException.class, error.getCause());
+        verify(configBackingStore, times(0)).removeConnectorConfig(anyString());
+    }
+
+    @Test
+    public void testTransactionalShareSinkRejectsClassicOffsetReset() {
+        configureTransactionalShareHerder(transactionalShareSnapshot(0, 0, false, TargetState.STOPPED), true, List.of());
+        FutureCallback<Message> callback = new FutureCallback<>();
+        herder.resetConnectorOffsets(CONN1, callback);
+        herder.tick();
+        ExecutionException error = assertThrows(ExecutionException.class, () -> callback.get(1, TimeUnit.SECONDS));
+        assertInstanceOf(BadRequestException.class, error.getCause());
+        verify(worker, times(0)).modifyConnectorOffsets(anyString(), anyMap(), any(), any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"share.group.id", "consumer.override.bootstrap.servers", "producer.override.bootstrap.servers", "admin.override.bootstrap.servers"})
+    public void testTransactionalShareSinkCannotMoveIdentityWhileRunning(String configKey) {
+        ClusterConfigState snapshot = transactionalShareSnapshot(1, 1, false, TargetState.STARTED);
+        configureTransactionalShareHerder(snapshot, true, List.of());
+        herder.tick();
+        expectMemberEnsureActive();
+        Map<String, String> updated = new HashMap<>(snapshot.connectorConfig(CONN1));
+        updated.put(configKey, "different-cluster:9092");
+        doAnswer(invocation -> {
+            Callback<ConfigInfos> callback = invocation.getArgument(1);
+            callback.onCompletion(null, CONN1_CONFIG_INFOS);
+            return null;
+        }).when(herder).validateConnectorConfig(eq(updated), any());
+        FutureCallback<Herder.Created<ConnectorInfo>> callback = new FutureCallback<>();
+        herder.putConnectorConfig(CONN1, updated, true, callback);
+        herder.tick();
+        herder.tick();
+        ExecutionException error = assertThrows(ExecutionException.class, () -> callback.get(1, TimeUnit.SECONDS));
+        assertInstanceOf(BadRequestException.class, error.getCause());
+        verify(configBackingStore, times(0)).putConnectorConfig(eq(CONN1), anyMap(), any());
+    }
+
+    @Test
+    public void testIdleTransactionalShareSinkRetriesSynchronousFencingFailure() {
+        ClusterConfigState snapshot = transactionalShareSnapshot(0, 3, true, TargetState.STOPPED);
+        configureTransactionalShareHerder(snapshot, true, List.of());
+        KafkaFuture<Void> workerFuture = mock(KafkaFuture.class);
+        KafkaFuture<Void> herderFuture = mock(KafkaFuture.class);
+        when(worker.fenceZombies(CONN1, 3, snapshot.connectorConfig(CONN1)))
+            .thenThrow(new ConnectException("temporary failure")).thenReturn(workerFuture);
+        when(workerFuture.thenApply(any(KafkaFuture.BaseFunction.class))).thenReturn(herderFuture);
+
+        herder.tick();
+        assertTrue(herder.fenceIdleTransactionalShareSinks());
+
+        verify(worker, times(2)).fenceZombies(CONN1, 3, snapshot.connectorConfig(CONN1));
+        verify(configBackingStore, times(0)).putTaskCountRecord(anyString(), anyInt());
+    }
+
+    @Test
+    public void testClassicSinkCannotUseTransactionalFencingRoute() {
+        configureTransactionalShareHerder(SNAPSHOT, true, List.of());
+        FutureCallback<Void> callback = new FutureCallback<>();
+        herder.fenceZombieSourceTasks(CONN1, callback);
+        herder.tick();
+        ExecutionException error = assertThrows(ExecutionException.class, () -> callback.get(1, TimeUnit.SECONDS));
+        assertInstanceOf(BadRequestException.class, error.getCause());
+        verify(worker, times(0)).fenceZombies(anyString(), anyInt(), anyMap());
+    }
+
+    @Test
+    public void testTransactionalShareSinkValidationRequiresConfigTopicFencing() {
+        Map<String, String> connectorConfig = new HashMap<>(transactionalShareSnapshot(1, null, false, TargetState.STARTED).connectorConfig(CONN1));
+        connectorConfig.put(SinkConnectorConfig.SHARE_GROUP_ID_CONFIG, HERDER_CONFIG.get(GROUP_ID_CONFIG));
+        Map<String, ConfigValue> validated = herder.validateSinkConnectorConfig(mock(SinkConnector.class),
+            SinkConnectorConfig.configDef(), connectorConfig);
+        assertTrue(validated.get(SinkConnectorConfig.SHARE_DELIVERY_GUARANTEE_CONFIG).errorMessages().stream()
+            .anyMatch(message -> message.contains("config-topic fencing")));
+        assertTrue(validated.get(SinkConnectorConfig.SHARE_GROUP_ID_CONFIG).errorMessages().stream()
+            .anyMatch(message -> message.contains("Connect worker group")));
+    }
+
+    private ClusterConfigState transactionalShareSnapshot(int taskCount, Integer previousCount, boolean pending, TargetState targetState) {
+        Map<String, String> connectorConfig = new HashMap<>(CONN1_CONFIG);
+        connectorConfig.put(SinkConnectorConfig.CONSUMER_TYPE_CONFIG, "share");
+        connectorConfig.put(SinkConnectorConfig.SHARE_GROUP_ID_CONFIG, "dedicated-share-sink");
+        connectorConfig.put(SinkConnectorConfig.SHARE_DELIVERY_GUARANTEE_CONFIG, "exactly_once");
+        Map<ConnectorTaskId, Map<String, String>> taskConfigs = IntStream.range(0, taskCount).boxed()
+            .collect(Collectors.toMap(task -> new ConnectorTaskId(CONN1, task), task -> TASK_CONFIG));
+        return new ClusterConfigState(1, null, Map.of(CONN1, taskCount), Map.of(CONN1, connectorConfig),
+            Map.of(CONN1, targetState), taskConfigs, previousCount == null ? Map.of() : Map.of(CONN1, previousCount),
+            Map.of(CONN1, 5), Map.of(CONN1, new AppliedConnectorConfig(connectorConfig)),
+            pending ? Set.of(CONN1) : Set.of(), Set.of());
+    }
+
+    private void configureTransactionalShareHerder(ClusterConfigState snapshot, boolean exactlyOnce, List<ConnectorTaskId> assignedTasks) {
+        if (exactlyOnce) herder = exactlyOnceHerder();
+        rebalanceListener = herder.new RebalanceListener(time);
+        configUpdateListener = herder.new ConfigUpdateListener();
+        when(member.memberId()).thenReturn("leader");
+        when(member.currentProtocolVersion()).thenReturn(CONNECT_PROTOCOL_V0);
+        when(herder.connectorType(anyMap())).thenReturn(ConnectorType.SINK);
+        when(statusBackingStore.connectors()).thenReturn(Set.of());
+        expectRebalance(1, List.of(), assignedTasks, true);
+        expectConfigRefreshAndSnapshot(snapshot);
+        expectMemberPoll();
     }
 
     @Test
