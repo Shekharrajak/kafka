@@ -328,10 +328,9 @@ public class ShareCoordinatorShard implements CoordinatorShard<CoordinatorRecord
                 batches = replaceRange(batches, new PersisterStateBatch(batch.firstOffset(), batch.lastOffset(),
                     result == TransactionResult.COMMIT ? batch.deliveryState() : (byte) 0, batch.deliveryCount()));
             }
-            long terminalCount = batches.stream().filter(batch -> batch.deliveryState() == 2 || batch.deliveryState() == 4)
-                .mapToLong(batch -> Math.max(0, batch.lastOffset() - Math.max(batch.firstOffset(), current.startOffset()) + 1)).sum();
             shareStateMap.put(key, current.builderSupplier().setStateBatches(batches)
-                .setDeliveryCompleteCount(Math.toIntExact(terminalCount)).setWriteTimestamp(time.milliseconds()).build());
+                .setDeliveryCompleteCount(terminalRecordCount(batches, current.startOffset()))
+                .setWriteTimestamp(time.milliseconds()).build());
         });
     }
 
@@ -788,7 +787,14 @@ public class ShareCoordinatorShard implements CoordinatorShard<CoordinatorRecord
             deliveryCompleteCount = currentState.deliveryCompleteCount();
         }
 
-        if (snapshotUpdateCount.getOrDefault(key, 0) >= updatesPerSnapshotLimit) {
+        boolean createSnapshot = snapshotUpdateCount.getOrDefault(key, 0) >= updatesPerSnapshotLimit;
+        boolean fencedState = !Uuid.ZERO_UUID.equals(currentState.stateIncarnationId()) &&
+            !Uuid.ZERO_UUID.equals(currentState.writerGeneration());
+        List<PersisterStateBatch> mergedBatches = createSnapshot || fencedState ?
+            mergeBatches(currentState.stateBatches(), partitionData, newStartOffset) : List.of();
+        if (fencedState) deliveryCompleteCount = terminalRecordCount(mergedBatches, newStartOffset);
+
+        if (createSnapshot) {
             // Since the number of update records for this share part key exceeds snapshotUpdateRecordsPerSnapshot
             // or state epoch has incremented, we should be creating a share snapshot record.
             // The incoming partition data could have overlapping state batches, we must merge them.
@@ -800,7 +806,7 @@ public class ShareCoordinatorShard implements CoordinatorShard<CoordinatorRecord
                     .setDeliveryCompleteCount(deliveryCompleteCount)
                     .setLeaderEpoch(newLeaderEpoch)
                     .setStateEpoch(currentState.stateEpoch())
-                    .setStateBatches(mergeBatches(currentState.stateBatches(), partitionData, newStartOffset))
+                    .setStateBatches(mergedBatches)
                     .setCreateTimestamp(timestamp)
                     .setWriteTimestamp(timestamp)
                     .build());
@@ -1195,6 +1201,11 @@ public class ShareCoordinatorShard implements CoordinatorShard<CoordinatorRecord
         return new WriteShareGroupStateResponseData().setResults(List.of(
             WriteShareGroupStateResponse.toResponseWriteStateResult(key.topicId(),
                 List.of(WriteShareGroupStateResponse.toResponsePartitionResult(key.partition())))));
+    }
+
+    private static int terminalRecordCount(List<PersisterStateBatch> batches, long startOffset) {
+        return Math.toIntExact(batches.stream().filter(batch -> batch.deliveryState() == 2 || batch.deliveryState() == 4)
+            .mapToLong(batch -> Math.max(0, batch.lastOffset() - Math.max(batch.firstOffset(), startOffset) + 1)).sum());
     }
 
     private static List<PersisterStateBatch> replaceRange(List<PersisterStateBatch> current, PersisterStateBatch replacement) {
