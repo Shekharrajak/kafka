@@ -36,6 +36,7 @@ import org.apache.kafka.clients.producer.internals.ProducerMetadata;
 import org.apache.kafka.clients.producer.internals.ProducerMetrics;
 import org.apache.kafka.clients.producer.internals.RecordAccumulator;
 import org.apache.kafka.clients.producer.internals.Sender;
+import org.apache.kafka.clients.producer.internals.ShareTransactionParticipant;
 import org.apache.kafka.clients.producer.internals.TransactionManager;
 import org.apache.kafka.clients.producer.internals.TransactionalRequestResult;
 import org.apache.kafka.common.Cluster;
@@ -769,6 +770,12 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
         producerMetrics.recordBeginTxn(time.nanoseconds() - now);
     }
 
+    public ShareTransactionParticipant.Registration registerShareTransactionParticipant(ShareTransactionParticipant participant) {
+        throwIfNoTransactionManager();
+        throwIfProducerClosed();
+        return transactionManager.registerShareTransactionParticipant(participant, sender::wakeup);
+    }
+
     /**
      * Sends a list of specified offsets to the consumer group coordinator, and also marks
      * those offsets as part of the current transaction. These offsets will be considered
@@ -899,6 +906,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
         throwIfNoTransactionManager();
         throwIfProducerClosed();
         throwIfInPreparedState();
+        transactionManager.ensureNoShareTransactionParticipant();
         if (!transactionManager.is2PCEnabled()) {
             throw new InvalidTxnStateException("Cannot prepare a transaction when 2PC is not enabled");
         }
@@ -950,6 +958,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
         TransactionalRequestResult result = transactionManager.beginCommit();
         sender.wakeup();
         result.await(maxBlockTimeMs, TimeUnit.MILLISECONDS, COMMIT_TXN_TIMEOUT_MSG);
+        transactionManager.runShareTransactionCallbacks();
         producerMetrics.recordCommitTxn(time.nanoseconds() - commitStart);
     }
 
@@ -986,6 +995,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
         TransactionalRequestResult result = transactionManager.beginAbort();
         sender.wakeup();
         result.await(maxBlockTimeMs, TimeUnit.MILLISECONDS, ABORT_TXN_TIMEOUT_MSG);
+        transactionManager.runShareTransactionCallbacks();
         producerMetrics.recordAbortTxn(time.nanoseconds() - abortStart);
     }
 

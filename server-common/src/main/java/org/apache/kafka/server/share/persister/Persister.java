@@ -17,6 +17,12 @@
 
 package org.apache.kafka.server.share.persister;
 
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.errors.UnsupportedVersionException;
+import org.apache.kafka.common.message.ReadShareGroupStateResponseData;
+import org.apache.kafka.common.message.WriteShareGroupStateRequestData;
+import org.apache.kafka.server.share.SharePartitionKey;
+
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -49,6 +55,25 @@ public interface Persister {
      * @return A {@link CompletableFuture} that completes with the result.
      */
     CompletableFuture<WriteShareGroupStateResult> writeState(WriteShareGroupStateParameters request);
+
+    default CompletableFuture<ReadShareGroupStateResponseData.PartitionResult> readFencedState(
+        SharePartitionKey key,
+        int leaderEpoch,
+        Uuid expectedWriterGeneration,
+        Uuid newWriterGeneration
+    ) {
+        return CompletableFuture.failedFuture(new UnsupportedVersionException("Share state writer fencing is unavailable"));
+    }
+
+    default CompletableFuture<Void> writeFencedState(
+        SharePartitionKey key,
+        WriteShareGroupStateRequestData.PartitionData partition,
+        String transactionalId,
+        long producerId,
+        short producerEpoch
+    ) {
+        return CompletableFuture.failedFuture(new UnsupportedVersionException("Fenced share state writes are unavailable"));
+    }
 
     /**
      * Delete share-partition state.

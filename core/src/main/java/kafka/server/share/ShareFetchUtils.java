@@ -17,6 +17,7 @@
 package kafka.server.share;
 
 import org.apache.kafka.common.TopicIdPartition;
+import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.message.ShareFetchResponseData;
 import org.apache.kafka.common.message.ShareFetchResponseData.AcquiredRecords;
 import org.apache.kafka.common.protocol.Errors;
@@ -206,10 +207,12 @@ public class ShareFetchUtils {
         long firstOffset = acquiredRecords.get(0).firstOffset();
         long lastOffset = acquiredRecords.get(0).lastOffset();
         short deliveryCount = acquiredRecords.get(0).deliveryCount();
+        Uuid acquisitionId = acquiredRecords.get(0).acquisitionId();
 
         for (int i = 1; i < acquiredRecords.size(); i++) {
             AcquiredRecords current = acquiredRecords.get(i);
-            if (current.firstOffset() == lastOffset + 1 && deliveryCount == current.deliveryCount()) {
+            if (current.firstOffset() == lastOffset + 1 && deliveryCount == current.deliveryCount()
+                && acquisitionId.equals(current.acquisitionId())) {
                 // Extend the last offset.
                 lastOffset = current.lastOffset();
             } else {
@@ -217,17 +220,20 @@ public class ShareFetchUtils {
                 result.add(new AcquiredRecords()
                     .setFirstOffset(firstOffset)
                     .setLastOffset(lastOffset)
-                    .setDeliveryCount(deliveryCount));
+                    .setDeliveryCount(deliveryCount)
+                    .setAcquisitionId(acquisitionId));
                 // Reset the accumulation variables to the current acquired records.
                 firstOffset = current.firstOffset();
                 lastOffset = current.lastOffset();
                 deliveryCount = current.deliveryCount();
+                acquisitionId = current.acquisitionId();
             }
         }
         // Add the last accumulated batch.
         result.add(new AcquiredRecords()
             .setFirstOffset(firstOffset)
             .setLastOffset(lastOffset)
-            .setDeliveryCount(deliveryCount));
+            .setDeliveryCount(deliveryCount)
+            .setAcquisitionId(acquisitionId));
     }
 }

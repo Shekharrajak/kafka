@@ -19,7 +19,9 @@
   "listeners": ["broker"],
   "name": "ReadShareGroupStateRequest",
   // Version 1 uses the v3 request header (KIP-1313).
-  "validVersions": "0-1",
+  // Version 2 supports reading and fencing transactional share state (KIP-1289).
+  "validVersions": "0-2",
+  "latestVersionUnstable": true,
   "flexibleVersions": "0+",
   "headerVersions": {
     "0": "2",
@@ -37,7 +39,11 @@
         { "name": "Partition", "type": "int32", "versions": "0+",
           "about": "The partition index." },
         { "name": "LeaderEpoch", "type": "int32", "versions": "0+",
-          "about": "The leader epoch of the share-partition." }
+          "about": "The leader epoch of the share-partition." },
+        { "name": "ExpectedWriterGeneration", "type": "uuid", "versions": "2+",
+          "about": "The current writer generation expected when requesting a fence." },
+        { "name": "NewWriterGeneration", "type": "uuid", "versions": "2+",
+          "about": "The writer generation to install before reading, or zero for a read without a fence." }
       ]}
     ]}
   ]

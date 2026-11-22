@@ -16,6 +16,7 @@
  */
 package org.apache.kafka.server.share.fetch;
 
+import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.server.share.metrics.SharePartitionMetrics;
 import org.apache.kafka.server.util.timer.Timer;
@@ -106,6 +107,14 @@ public class InFlightBatch {
      */
     public String batchMemberId() {
         return inFlightState().memberId();
+    }
+
+    public Uuid batchAcquisitionId() {
+        return inFlightState().acquisitionId();
+    }
+
+    public void updateAcquisitionId(Uuid acquisitionId) {
+        inFlightState().updateAcquisitionId(acquisitionId);
     }
 
     /**
@@ -209,6 +218,7 @@ public class InFlightBatch {
                 if (offset <= targetOffset) {
                     AcquisitionLockTimerTask timerTask = acquisitionLockTimerTask(batchState.memberId(), offset, offset, delayMs);
                     offsetState.put(offset, new InFlightState(batchState.state(), batchState.deliveryCount(), batchState.memberId(), timerTask));
+                    offsetState.get(offset).updateAcquisitionId(batchState.acquisitionId());
                     timer.add(timerTask);
                 } else {
                     offsetState.put(offset, new InFlightState(RecordState.AVAILABLE, batchState.deliveryCount() - 1, EMPTY_MEMBER_ID));
@@ -235,9 +245,11 @@ public class InFlightBatch {
                     long delayMs = batchState.acquisitionLockTimeoutTask().expirationMs() - time.hiResClockMs();
                     AcquisitionLockTimerTask timerTask = acquisitionLockTimerTask(batchState.memberId(), offset, offset, delayMs);
                     offsetState.put(offset, new InFlightState(batchState.state(), batchState.deliveryCount(), batchState.memberId(), timerTask));
+                    offsetState.get(offset).updateAcquisitionId(batchState.acquisitionId());
                     timer.add(timerTask);
                 } else {
                     offsetState.put(offset, new InFlightState(batchState.state(), batchState.deliveryCount(), batchState.memberId()));
+                    offsetState.get(offset).updateAcquisitionId(batchState.acquisitionId());
                 }
             }
             // Cancel the acquisition lock timeout task for the batch as the offset state is maintained.

@@ -23,7 +23,7 @@ import kafka.log.LogManager
 import kafka.network.SocketServer
 import kafka.raft.KafkaRaftManager
 import kafka.server.metadata._
-import kafka.server.share.{ReplicaManagerLogReader, ReplicaManagerPartitionMetadataProvider, ShareCoordinatorMetadataCacheHelperImpl, SharePartitionManager}
+import kafka.server.share.{ReplicaManagerLogReader, ReplicaManagerPartitionMetadataProvider, ShareCoordinatorMetadataCacheHelperImpl, SharePartitionManager, ShareTransactionCompletionSender}
 import org.apache.kafka.common.config.{ConfigException, ConfigResource}
 import org.apache.kafka.common.internals.Plugin
 import org.apache.kafka.common.message.ApiMessageType.ListenerType
@@ -145,6 +145,8 @@ class BrokerServer(
   var autoTopicCreationManager: AutoTopicCreationManager = _
 
   var kafkaScheduler: KafkaScheduler = _
+
+  private var shareTransactionCompletionSender: ShareTransactionCompletionSender = _
 
   @volatile var metadataCache: KRaftMetadataCache = _
 
@@ -490,7 +492,8 @@ class BrokerServer(
         shareGroupMetrics,
         brokerTopicStats,
         () => ShareVersion.fromFeatureLevel(metadataCache.features.finalizedFeatures.getOrDefault(ShareVersion.FEATURE_NAME, 0.toShort)).supportsShareGroupDLQ(),
-        shareGroupDLQManager
+        shareGroupDLQManager,
+        () => ShareVersion.fromFeatureLevel(metadataCache.features.finalizedFeatures.getOrDefault(ShareVersion.FEATURE_NAME, 0.toShort)).supportsTransactionalAcknowledgements()
       )
 
       dataPlaneRequestProcessor = new KafkaApis(
@@ -753,11 +756,14 @@ class BrokerServer(
     val writer = new CoordinatorPartitionWriter(
       replicaManager
     )
+    shareTransactionCompletionSender = ShareTransactionCompletionSender(config, metrics, metadataCache, time)
+    shareTransactionCompletionSender.start()
     new ShareCoordinatorService.Builder(config.brokerId, config.shareCoordinatorConfig)
       .withTimer(timer)
       .withTime(time)
       .withLoader(loader)
       .withWriter(writer)
+      .withTransactionCompletionListener((completion, result) => shareTransactionCompletionSender.enqueue(completion, result))
       .withCoordinatorRuntimeMetrics(new ShareCoordinatorRuntimeMetrics(metrics))
       .withCoordinatorMetrics(new ShareCoordinatorMetrics(metrics))
       .build()
@@ -921,6 +927,9 @@ class BrokerServer(
 
       if (shareCoordinator != null)
         Utils.swallow(this.logger.underlying, () => shareCoordinator.shutdown())
+
+      if (shareTransactionCompletionSender != null)
+        Utils.swallow(this.logger.underlying, () => shareTransactionCompletionSender.shutdown())
 
       if (assignmentsManager != null)
         Utils.swallow(this.logger.underlying, () => assignmentsManager.close())

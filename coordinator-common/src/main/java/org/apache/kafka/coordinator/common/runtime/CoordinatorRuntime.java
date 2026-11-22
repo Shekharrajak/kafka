@@ -2220,6 +2220,19 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         CoordinatorWriteOperation<S, T, U> op,
         int apiVersion
     ) {
+        return scheduleTransactionalWriteOperation(name, tp, transactionalId, producerId, producerEpoch, op,
+            PartitionWriter.TransactionVerificationMode.forTxnOffsetCommitVersion(apiVersion));
+    }
+
+    public <T> CompletableFuture<T> scheduleTransactionalWriteOperation(
+        String name,
+        TopicPartition tp,
+        String transactionalId,
+        long producerId,
+        short producerEpoch,
+        CoordinatorWriteOperation<S, T, U> op,
+        PartitionWriter.TransactionVerificationMode mode
+    ) {
         try {
             throwIfNotRunning();
             log.debug("Scheduled execution of transactional write operation {}.", name);
@@ -2228,7 +2241,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
                 transactionalId,
                 producerId,
                 producerEpoch,
-                apiVersion
+                mode
             ).thenCompose(verificationGuard -> {
                 CoordinatorWriteEvent<T> event = new CoordinatorWriteEvent<>(
                     name,

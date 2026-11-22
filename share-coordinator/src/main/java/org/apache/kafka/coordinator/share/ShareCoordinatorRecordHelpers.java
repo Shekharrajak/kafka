@@ -33,6 +33,8 @@ public class ShareCoordinatorRecordHelpers {
                 .setTopicId(topicId)
                 .setPartition(partitionId),
             new ApiMessageAndVersion(new ShareSnapshotValue()
+                .setStateIncarnationId(offsetData.stateIncarnationId())
+                .setWriterGeneration(offsetData.writerGeneration())
                 .setSnapshotEpoch(offsetData.snapshotEpoch())
                 .setStateEpoch(offsetData.stateEpoch())
                 .setLeaderEpoch(offsetData.leaderEpoch())
@@ -59,6 +61,7 @@ public class ShareCoordinatorRecordHelpers {
                 .setTopicId(topicId)
                 .setPartition(partitionId),
             new ApiMessageAndVersion(new ShareUpdateValue()
+                .setStateIncarnationId(offsetData.stateIncarnationId())
                 .setSnapshotEpoch(offsetData.snapshotEpoch())
                 .setLeaderEpoch(offsetData.leaderEpoch())
                 .setStartOffset(offsetData.startOffset())

@@ -34,6 +34,7 @@ import org.apache.kafka.common.requests.DeleteShareGroupStateResponse;
 import org.apache.kafka.common.requests.InitializeShareGroupStateResponse;
 import org.apache.kafka.common.requests.ReadShareGroupStateResponse;
 import org.apache.kafka.common.requests.ReadShareGroupStateSummaryResponse;
+import org.apache.kafka.common.requests.TransactionResult;
 import org.apache.kafka.common.requests.WriteShareGroupStateResponse;
 import org.apache.kafka.common.utils.MockTime;
 import org.apache.kafka.common.utils.Time;
@@ -61,6 +62,8 @@ import org.apache.kafka.timeline.SnapshotRegistry;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.HashMap;
 import java.util.List;
@@ -2408,6 +2411,205 @@ class ShareCoordinatorShardTest {
             return ShareGroupOffset.fromRecord((ShareSnapshotValue) record);
         }
         return ShareGroupOffset.fromRecord((ShareUpdateValue) record);
+    }
+
+    @Test
+    public void testTransactionalShareUpdateIsPendingUntilCommitAndSnapshot() {
+        Uuid incarnation = activateTransactionalState();
+        WriteShareGroupStateRequestData request = transactionalWrite(incarnation, transactionalWriter, 3, 6, (byte) 2);
+        CoordinatorResult<WriteShareGroupStateResponseData, CoordinatorRecord> staged = shard.writeState(request);
+        assertEquals(Errors.NONE.code(), staged.response().results().get(0).partitions().get(0).errorCode());
+        shard.replay(3L, 17L, (short) 2, staged.records().get(0));
+
+        assertEquals(List.of(new PersisterStateBatch(0, 10, (byte) 0, (short) 1)),
+            shard.getShareStateMapValue(SHARE_PARTITION_KEY).stateBatches());
+        assertEquals(1, transactionalRead().pendingTransactions().size());
+        assertEquals(Optional.of(3L), shard.lastRedundantOffset().response());
+        assertTrue(shard.writeState(request).records().isEmpty());
+
+        shard.replayEndTransactionMarker(17L, (short) 3, TransactionResult.COMMIT);
+        assertTrue(transactionalRead().pendingTransactions().isEmpty());
+        assertEquals(4, shard.getShareStateMapValue(SHARE_PARTITION_KEY).deliveryCompleteCount());
+        assertEquals(Set.of(SHARE_PARTITION_KEY), shard.transactionCompletion(17L, (short) 2).orElseThrow().sharePartitions());
+        assertEquals("txn", shard.transactionCompletion(17L, (short) 2).orElseThrow().transactionalId());
+        assertEquals(Optional.of(3L), shard.lastRedundantOffset().response());
+        shard.replayEndTransactionMarker(17L, (short) 3, TransactionResult.COMMIT);
+        assertEquals(4, shard.getShareStateMapValue(SHARE_PARTITION_KEY).deliveryCompleteCount());
+
+        CoordinatorResult<Void, CoordinatorRecord> covering = shard.snapshotColdPartitions();
+        assertEquals(1, covering.records().size());
+        shard.replay(5L, -1L, (short) -1, covering.records().get(0));
+        assertEquals(Optional.empty(), shard.lastRedundantOffset().response());
+        assertTrue(shard.transactionCompletion(17L, (short) 2).isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 100})
+    public void testFencedFrontierWriteRetainsCommittedTerminalCount(int snapshotUpdateLimit) {
+        shard = new ShareCoordinatorShardBuilder().setConfigOverrides(Map.of(
+            ShareCoordinatorConfig.SNAPSHOT_UPDATE_RECORDS_PER_SNAPSHOT_CONFIG, Integer.toString(snapshotUpdateLimit))).build();
+        Uuid incarnation = activateTransactionalState();
+        CoordinatorRecord staged = shard.writeState(transactionalWrite(incarnation, transactionalWriter, 0, 9, (byte) 2))
+            .records().get(0);
+        shard.replay(3L, 17L, (short) 2, staged);
+        WriteShareGroupStateRequestData delayed = transactionalWrite(incarnation, transactionalWriter, 10, 10, (byte) 0)
+            .setTransactionalId(null).setProducerId(-1).setProducerEpoch((short) -1);
+        delayed.topics().get(0).partitions().get(0).setStartOffset(5).setDeliveryCompleteCount(0);
+
+        shard.replayEndTransactionMarker(17L, (short) 3, TransactionResult.COMMIT);
+        assertEquals(10, shard.getShareStateMapValue(SHARE_PARTITION_KEY).deliveryCompleteCount());
+        CoordinatorResult<WriteShareGroupStateResponseData, CoordinatorRecord> written = shard.writeState(delayed);
+        assertEquals(Errors.NONE.code(), written.response().results().get(0).partitions().get(0).errorCode());
+        CoordinatorRecord record = written.records().get(0);
+        if (snapshotUpdateLimit == 0) {
+            assertEquals(5, assertInstanceOf(ShareSnapshotValue.class, record.value().message()).deliveryCompleteCount());
+        } else {
+            assertEquals(5, assertInstanceOf(ShareUpdateValue.class, record.value().message()).deliveryCompleteCount());
+        }
+        shard.replay(4L, -1L, (short) -1, record);
+
+        ShareGroupOffset persisted = shard.getShareStateMapValue(SHARE_PARTITION_KEY);
+        assertEquals(5, persisted.startOffset());
+        assertEquals(5, persisted.deliveryCompleteCount());
+        assertEquals(List.of(new PersisterStateBatch(5, 9, (byte) 2, (short) 1),
+            new PersisterStateBatch(10, 10, (byte) 0, (short) 1)), persisted.stateBatches());
+        assertEquals(10, persisted.startOffset() + persisted.deliveryCompleteCount());
+    }
+
+    @Test
+    public void testTransactionalAbortAndOrdinaryOverlap() {
+        Uuid incarnation = activateTransactionalState();
+        CoordinatorResult<WriteShareGroupStateResponseData, CoordinatorRecord> staged = shard.writeState(
+            transactionalWrite(incarnation, transactionalWriter, 3, 6, (byte) 3));
+        shard.replay(3L, 17L, (short) 2, staged.records().get(0));
+        assertEquals((byte) 3, transactionalRead().pendingTransactions().get(0).stateBatches().get(0).deliveryState());
+        assertEquals((byte) 0, transactionalRead().stateBatches().get(0).deliveryState());
+
+        WriteShareGroupStateRequestData conflict = transactionalWrite(incarnation, transactionalWriter, 5, 8, (byte) 2)
+            .setTransactionalId(null).setProducerId(-1).setProducerEpoch((short) -1);
+        assertEquals(Errors.INVALID_RECORD_STATE.code(), shard.writeState(conflict).response()
+            .results().get(0).partitions().get(0).errorCode());
+        shard.replayEndTransactionMarker(17L, (short) 3, TransactionResult.ABORT);
+        assertTrue(transactionalRead().pendingTransactions().isEmpty());
+        assertEquals(List.of(new PersisterStateBatch(0, 10, (byte) 0, (short) 1)),
+            shard.getShareStateMapValue(SHARE_PARTITION_KEY).stateBatches());
+    }
+
+    @Test
+    public void testWriterGenerationFenceIsIdempotentAndPreservesPending() {
+        Uuid incarnation = activateTransactionalState();
+        CoordinatorResult<WriteShareGroupStateResponseData, CoordinatorRecord> staged = shard.writeState(
+            transactionalWrite(incarnation, transactionalWriter, 3, 6, (byte) 2));
+        shard.replay(3L, 17L, (short) 2, staged.records().get(0));
+        Uuid next = Uuid.randomUuid();
+        ReadShareGroupStateRequestData read = transactionalReadRequest();
+        read.topics().get(0).partitions().get(0).setExpectedWriterGeneration(transactionalWriter).setNewWriterGeneration(next);
+        CoordinatorResult<ReadShareGroupStateResponseData, CoordinatorRecord> fenced = shard.readStateAndMaybeUpdateLeaderEpoch(read);
+        assertEquals(1, fenced.records().size());
+        shard.replay(4L, -1L, (short) -1, fenced.records().get(0));
+        assertTrue(shard.readStateAndMaybeUpdateLeaderEpoch(read).records().isEmpty());
+        assertEquals(1, transactionalRead().pendingTransactions().size());
+        assertEquals(Optional.of(3L), shard.lastRedundantOffset().response());
+        assertEquals(Errors.FENCED_STATE_EPOCH.code(), shard.writeState(
+            transactionalWrite(incarnation, transactionalWriter, 3, 6, (byte) 2)).response()
+            .results().get(0).partitions().get(0).errorCode());
+    }
+
+    @Test
+    public void testMarkerRollbackRestoresPendingStateAndPin() {
+        ShareCoordinatorShardBuilder builder = new ShareCoordinatorShardBuilder();
+        shard = builder.build();
+        Uuid incarnation = activateTransactionalState();
+        CoordinatorResult<WriteShareGroupStateResponseData, CoordinatorRecord> staged = shard.writeState(
+            transactionalWrite(incarnation, transactionalWriter, 3, 6, (byte) 2));
+        shard.replay(3L, 17L, (short) 2, staged.records().get(0));
+        builder.snapshotRegistry.idempotentCreateSnapshot(4L);
+        shard.replayEndTransactionMarker(17L, (short) 3, TransactionResult.COMMIT);
+        assertEquals(4, shard.getShareStateMapValue(SHARE_PARTITION_KEY).deliveryCompleteCount());
+        builder.snapshotRegistry.revertToSnapshot(4L);
+        assertEquals(0, shard.getShareStateMapValue(SHARE_PARTITION_KEY).deliveryCompleteCount());
+        assertEquals(1, transactionalRead().pendingTransactions().size());
+        assertEquals(Optional.of(3L), shard.lastRedundantOffset().response());
+    }
+
+    @Test
+    public void testPendingTransactionSurvivesSnapshotBeforeMarkerReplay() {
+        Uuid incarnation = activateTransactionalState();
+        CoordinatorRecord update = shard.writeState(transactionalWrite(incarnation, transactionalWriter, 3, 6, (byte) 2))
+            .records().get(0);
+        shard.replay(3L, 17L, (short) 2, update);
+        CoordinatorRecord snapshot = ShareCoordinatorRecordHelpers.newShareSnapshotRecord(GROUP_ID, TOPIC_ID, PARTITION,
+            shard.getShareStateMapValue(SHARE_PARTITION_KEY).builderSupplier().setSnapshotEpoch(2).build());
+        shard.replay(4L, -1L, (short) -1, snapshot);
+        assertEquals(Optional.of(3L), shard.lastRedundantOffset().response());
+
+        ShareCoordinatorShard recovered = new ShareCoordinatorShardBuilder().build();
+        recovered.replay(3L, 17L, (short) 2, update);
+        recovered.replay(4L, -1L, (short) -1, snapshot);
+        recovered.replayEndTransactionMarker(17L, (short) 3, TransactionResult.COMMIT);
+        assertEquals(4, recovered.getShareStateMapValue(SHARE_PARTITION_KEY).deliveryCompleteCount());
+    }
+
+    @Test
+    public void testActivatedStateRejectsUnfencedDeleteButAllowsTopicCleanup() {
+        activateTransactionalState();
+        DeleteShareGroupStateRequestData delete = new DeleteShareGroupStateRequestData().setGroupId(GROUP_ID)
+            .setTopics(List.of(new DeleteShareGroupStateRequestData.DeleteStateData().setTopicId(TOPIC_ID)
+                .setPartitions(List.of(new DeleteShareGroupStateRequestData.PartitionData().setPartition(PARTITION)))));
+        assertEquals(Errors.INVALID_REQUEST.code(), shard.deleteState(delete).response()
+            .results().get(0).partitions().get(0).errorCode());
+        CoordinatorResult<Void, CoordinatorRecord> cleanup = shard.maybeCleanupShareState(Set.of(TOPIC_ID));
+        assertEquals(1, cleanup.records().size());
+        shard.replay(3L, -1L, (short) -1, cleanup.records().get(0));
+        assertNull(shard.getShareStateMapValue(SHARE_PARTITION_KEY));
+    }
+
+    @Test
+    public void testActivatedInitializeRequiresNewStateEpoch() {
+        Uuid incarnation = activateTransactionalState();
+        InitializeShareGroupStateRequestData.PartitionData reset = new InitializeShareGroupStateRequestData.PartitionData()
+            .setPartition(PARTITION).setStateEpoch(0).setStartOffset(5);
+        assertEquals(Errors.FENCED_STATE_EPOCH.code(), shard.initializeState(GROUP_ID, TOPIC_ID, reset)
+            .response().results().get(0).partitions().get(0).errorCode());
+        reset.setStateEpoch(1);
+        CoordinatorResult<InitializeShareGroupStateResponseData, CoordinatorRecord> result = shard.initializeState(GROUP_ID, TOPIC_ID, reset);
+        shard.replay(3L, -1L, (short) -1, result.records().get(0));
+        assertNotEquals(incarnation, shard.getShareStateMapValue(SHARE_PARTITION_KEY).stateIncarnationId());
+        assertEquals(Uuid.ZERO_UUID, shard.getShareStateMapValue(SHARE_PARTITION_KEY).writerGeneration());
+    }
+
+    private Uuid transactionalWriter;
+
+    private Uuid activateTransactionalState() {
+        initSharePartition(shard, SHARE_PARTITION_KEY);
+        writeAndReplayDefaultRecord(shard);
+        transactionalWriter = Uuid.randomUuid();
+        ReadShareGroupStateRequestData read = transactionalReadRequest();
+        read.topics().get(0).partitions().get(0).setNewWriterGeneration(transactionalWriter);
+        CoordinatorResult<ReadShareGroupStateResponseData, CoordinatorRecord> activation = shard.readStateAndMaybeUpdateLeaderEpoch(read);
+        assertEquals(1, activation.records().size());
+        shard.replay(2L, -1L, (short) -1, activation.records().get(0));
+        return activation.response().results().get(0).partitions().get(0).stateIncarnationId();
+    }
+
+    private ReadShareGroupStateRequestData transactionalReadRequest() {
+        return new ReadShareGroupStateRequestData().setGroupId(GROUP_ID).setTopics(List.of(
+            new ReadShareGroupStateRequestData.ReadStateData().setTopicId(TOPIC_ID).setPartitions(List.of(
+                new ReadShareGroupStateRequestData.PartitionData().setPartition(PARTITION).setLeaderEpoch(0)))));
+    }
+
+    private ReadShareGroupStateResponseData.PartitionResult transactionalRead() {
+        return shard.readStateAndMaybeUpdateLeaderEpoch(transactionalReadRequest()).response().results().get(0).partitions().get(0);
+    }
+
+    private WriteShareGroupStateRequestData transactionalWrite(Uuid incarnation, Uuid writer, long first, long last, byte state) {
+        return new WriteShareGroupStateRequestData().setGroupId(GROUP_ID).setTransactionalId("txn")
+            .setProducerId(17L).setProducerEpoch((short) 2).setTopics(List.of(
+                new WriteShareGroupStateRequestData.WriteStateData().setTopicId(TOPIC_ID).setPartitions(List.of(
+                    new WriteShareGroupStateRequestData.PartitionData().setPartition(PARTITION).setStateEpoch(0).setLeaderEpoch(0)
+                        .setStateIncarnationId(incarnation).setWriterGeneration(writer).setStartOffset(-1).setDeliveryCompleteCount(-1)
+                        .setStateBatches(List.of(new WriteShareGroupStateRequestData.StateBatch().setFirstOffset(first)
+                            .setLastOffset(last).setDeliveryCount((short) 1).setDeliveryState(state)))))));
     }
 
     private void initSharePartition(ShareCoordinatorShard shard, SharePartitionKey key) {

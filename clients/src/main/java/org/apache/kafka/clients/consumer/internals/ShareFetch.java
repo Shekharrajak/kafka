@@ -178,6 +178,38 @@ public class ShareFetch<K, V> {
         throw new IllegalStateException("The record cannot be acknowledged.");
     }
 
+    TransactionalShareAcknowledgement transactionalAcknowledgement(ConsumerRecord<K, V> record, AcknowledgeType type) {
+        return findInFlightBatch(record).transactionalAcknowledgement(record, type);
+    }
+
+    void removeTransactionalRecord(ConsumerRecord<K, V> record, TransactionalShareAcknowledgement acknowledgement) {
+        findInFlightBatch(record).removeTransactionalRecord(record, acknowledgement);
+    }
+
+    private ShareInFlightBatch<K, V> findInFlightBatch(ConsumerRecord<K, V> record) {
+        for (Map.Entry<TopicIdPartition, List<ShareInFlightBatch<K, V>>> entry : batches.entrySet()) {
+            if (entry.getKey().topic().equals(record.topic()) && entry.getKey().partition() == record.partition()) {
+                for (ShareInFlightBatch<K, V> batch : entry.getValue()) {
+                    if (batch.isInFlight(record.offset())) {
+                        return batch;
+                    }
+                }
+            }
+        }
+        throw new IllegalStateException("The record cannot be acknowledged.");
+    }
+
+    Map<TopicIdPartition, NodeAcknowledgements> takeGapAcknowledgements() {
+        for (List<ShareInFlightBatch<K, V>> partitionBatches : batches.values()) {
+            for (ShareInFlightBatch<K, V> batch : partitionBatches) {
+                if (batch.getAcknowledgements().getAcknowledgementsTypeMap().values().stream().anyMatch(Objects::nonNull)) {
+                    throw new IllegalStateException("Terminal acknowledgements cannot be sent outside the producer transaction");
+                }
+            }
+        }
+        return takeAcknowledgedRecords();
+    }
+
     /**
      * Acknowledge a single record which experienced an exception during its delivery by its topic, partition
      * and offset in the current batch. This method is specifically for overriding the default acknowledge

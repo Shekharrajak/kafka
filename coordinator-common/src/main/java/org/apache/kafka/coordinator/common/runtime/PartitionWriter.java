@@ -30,6 +30,22 @@ import java.util.concurrent.CompletableFuture;
  */
 public interface PartitionWriter {
 
+    enum TransactionVerificationMode {
+        VERIFY_ONLY,
+        VERIFY_WITH_ABORTABLE_ERROR,
+        ADD_PARTITION;
+
+        public static TransactionVerificationMode forTxnOffsetCommitVersion(int apiVersion) {
+            if (apiVersion > 4) {
+                return ADD_PARTITION;
+            } else if (apiVersion > 3) {
+                return VERIFY_WITH_ABORTABLE_ERROR;
+            } else {
+                return VERIFY_ONLY;
+            }
+        }
+    }
+
     /**
      * Listener allowing to listen to high watermark changes. This is meant
      * to be used in conjunction with {@link PartitionWriter#append(TopicPartition, VerificationGuard, MemoryRecords, short)}.
@@ -124,7 +140,7 @@ public interface PartitionWriter {
      * @param transactionalId   The transactional id.
      * @param producerId        The producer id.
      * @param producerEpoch     The producer epoch.
-     * @param apiVersion        The version of the Request used.
+     * @param mode              The transaction verification behavior.
      * @return A future failed with any error encountered; or the {@link VerificationGuard}
      *         if the transaction required verification and {@link VerificationGuard#SENTINEL}
      *         if it did not.
@@ -135,7 +151,7 @@ public interface PartitionWriter {
         String transactionalId,
         long producerId,
         short producerEpoch,
-        int apiVersion
+        TransactionVerificationMode mode
     ) throws KafkaException;
 
     /**

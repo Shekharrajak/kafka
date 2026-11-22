@@ -38,9 +38,17 @@ public class WriteShareGroupStateRequest extends AbstractRequest {
          * @param requestHeaderVersion the latest request header version which may be used
          */
         public Builder(WriteShareGroupStateRequestData data, short requestHeaderVersion) {
-            super(ApiKeys.WRITE_SHARE_GROUP_STATE,
+            this(data,
                 ApiKeys.WRITE_SHARE_GROUP_STATE.oldestVersion(),
                 ApiKeys.WRITE_SHARE_GROUP_STATE.latestVersionForRequestHeader(requestHeaderVersion));
+        }
+
+        public static Builder forTransactionalState(WriteShareGroupStateRequestData data) {
+            return new Builder(data, (short) 3, (short) 3);
+        }
+
+        private Builder(WriteShareGroupStateRequestData data, short oldestVersion, short latestVersion) {
+            super(ApiKeys.WRITE_SHARE_GROUP_STATE, oldestVersion, latestVersion);
             this.data = data;
         }
 

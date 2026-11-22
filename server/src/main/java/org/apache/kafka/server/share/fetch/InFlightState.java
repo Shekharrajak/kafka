@@ -17,6 +17,8 @@
 
 package org.apache.kafka.server.share.fetch;
 
+import org.apache.kafka.common.Uuid;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -43,6 +45,7 @@ public class InFlightState {
     private RecordState state;
     // The number of times the records has been delivered to the client.
     private int deliveryCount;
+    private Uuid acquisitionId = Uuid.ZERO_UUID;
     // The member id of the client that is fetching/acknowledging the record.
     private String memberId;
     // The state of the records before the transition. In case we need to revert an in-flight state, we revert the above
@@ -71,6 +74,29 @@ public class InFlightState {
      */
     public RecordState state() {
         return state;
+    }
+
+    public Uuid acquisitionId() {
+        return acquisitionId;
+    }
+
+    public void updateAcquisitionId(Uuid acquisitionId) {
+        this.acquisitionId = Objects.requireNonNull(acquisitionId);
+    }
+
+    public void completeTransactionalTransition(RecordState outcome) {
+        if (!hasOngoingStateTransition()) {
+            throw new IllegalStateException("No transactional transition is pending");
+        }
+        if (outcome != RecordState.AVAILABLE && outcome != RecordState.ACKNOWLEDGED &&
+            outcome != RecordState.ARCHIVING && outcome != RecordState.ARCHIVED) {
+            throw new IllegalArgumentException("Invalid transactional outcome: " + outcome);
+        }
+        state = outcome;
+        memberId = EMPTY_MEMBER_ID;
+        rollbackState = null;
+        acquisitionId = Uuid.ZERO_UUID;
+        cancelAndClearAcquisitionLockTimeoutTask();
     }
 
     /**

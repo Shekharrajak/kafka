@@ -27,6 +27,7 @@ import org.apache.kafka.common.errors.NotLeaderOrFollowerException;
 import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
 import org.apache.kafka.common.message.ShareAcknowledgeResponseData;
 import org.apache.kafka.common.message.ShareFetchResponseData.PartitionData;
+import org.apache.kafka.common.message.TxnShareAcknowledgeRequestData.AcknowledgementBatch;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.requests.ShareRequestMetadata;
 import org.apache.kafka.common.utils.Time;
@@ -74,6 +75,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.BiConsumer;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -174,6 +176,8 @@ public class SharePartitionManager implements AutoCloseable {
      * Reference to the DLQ manager implementation.
      */
     private final ShareGroupDLQManager shareGroupDLQManager;
+    private final BooleanSupplier transactionalAcksEnabled;
+    private boolean transactionalAcksActive;
 
     @SuppressWarnings("ParameterNumber")
     public SharePartitionManager(
@@ -192,7 +196,8 @@ public class SharePartitionManager implements AutoCloseable {
         ShareGroupMetrics shareGroupMetrics,
         BrokerTopicStats brokerTopicStats,
         Supplier<Boolean> shareGroupDlqEnableSupplier,
-        ShareGroupDLQManager shareGroupDLQManager
+        ShareGroupDLQManager shareGroupDLQManager,
+        BooleanSupplier transactionalAcksEnabled
     ) {
         this(replicaManager,
             logReader,
@@ -210,7 +215,8 @@ public class SharePartitionManager implements AutoCloseable {
             shareGroupMetrics,
             brokerTopicStats,
             shareGroupDlqEnableSupplier,
-            shareGroupDLQManager
+            shareGroupDLQManager,
+            transactionalAcksEnabled
         );
     }
 
@@ -232,7 +238,8 @@ public class SharePartitionManager implements AutoCloseable {
         ShareGroupMetrics shareGroupMetrics,
         BrokerTopicStats brokerTopicStats,
         Supplier<Boolean> shareGroupDlqEnableSupplier,
-        ShareGroupDLQManager shareGroupDLQManager
+        ShareGroupDLQManager shareGroupDLQManager,
+        BooleanSupplier transactionalAcksEnabled
     ) {
         this(replicaManager,
             logReader,
@@ -252,7 +259,8 @@ public class SharePartitionManager implements AutoCloseable {
             shareGroupMetrics,
             brokerTopicStats,
             shareGroupDlqEnableSupplier,
-            shareGroupDLQManager
+            shareGroupDLQManager,
+            transactionalAcksEnabled
         );
     }
 
@@ -278,6 +286,34 @@ public class SharePartitionManager implements AutoCloseable {
             Supplier<Boolean> shareGroupDlqEnableSupplier,
             ShareGroupDLQManager shareGroupDLQManager
     ) {
+        this(replicaManager, logReader, metadataProvider, delayedRequestNotifier, time, cache, partitionCache,
+            defaultRecordLockDurationMs, timer, maxDeliveryCount, maxInFlightRecords, remoteFetchMaxWaitMs,
+            persister, configProvider, shareGroupMetrics, brokerTopicStats, shareGroupDlqEnableSupplier,
+            shareGroupDLQManager, () -> false);
+    }
+
+    @SuppressWarnings("ParameterNumber")
+    private SharePartitionManager(
+            ReplicaManager replicaManager,
+            LogReader logReader,
+            PartitionMetadataProvider metadataProvider,
+            Consumer<DelayedShareFetchKey> delayedRequestNotifier,
+            Time time,
+            ShareSessionCache cache,
+            SharePartitionCache partitionCache,
+            int defaultRecordLockDurationMs,
+            Timer timer,
+            int maxDeliveryCount,
+            int maxInFlightRecords,
+            long remoteFetchMaxWaitMs,
+            Persister persister,
+            ShareGroupConfigProvider configProvider,
+            ShareGroupMetrics shareGroupMetrics,
+            BrokerTopicStats brokerTopicStats,
+            Supplier<Boolean> shareGroupDlqEnableSupplier,
+            ShareGroupDLQManager shareGroupDLQManager,
+            BooleanSupplier transactionalAcksEnabled
+    ) {
         this.replicaManager = replicaManager;
         this.logReader = logReader;
         this.metadataProvider = metadataProvider;
@@ -297,6 +333,7 @@ public class SharePartitionManager implements AutoCloseable {
         this.cache.registerShareGroupListener(new ShareGroupListenerImpl());
         this.shareGroupDlqEnableSupplier = shareGroupDlqEnableSupplier;
         this.shareGroupDLQManager = shareGroupDLQManager;
+        this.transactionalAcksEnabled = transactionalAcksEnabled;
     }
 
     /**
@@ -393,6 +430,38 @@ public class SharePartitionManager implements AutoCloseable {
         });
 
         return mapAcknowledgementFutures(futures, Optional.of(failedShareAcknowledgeMetricsHandler()));
+    }
+
+    @SuppressWarnings("ParameterNumber")
+    public CompletableFuture<Void> acknowledgeTransactional(
+        String groupId,
+        String memberId,
+        TopicIdPartition topicIdPartition,
+        String transactionalId,
+        long producerId,
+        short producerEpoch,
+        List<AcknowledgementBatch> batches
+    ) {
+        SharePartitionKey key = sharePartitionKey(groupId, topicIdPartition);
+        SharePartition sharePartition = partitionCache.get(key);
+        if (sharePartition == null) {
+            return CompletableFuture.failedFuture(Errors.NOT_LEADER_OR_FOLLOWER.exception());
+        }
+        return sharePartition.acknowledgeTransactional(memberId, transactionalId, producerId, producerEpoch, batches)
+            .whenComplete((ignored, failure) -> {
+                if (failure != null && isFencedSharePartitionError(Errors.maybeUnwrapException(failure))) {
+                    closeRemovedSharePartition(key, partitionCache.remove(key, sharePartition), metadataProvider, delayedRequestNotifier);
+                }
+            });
+    }
+
+    public void reconcileTransactionalAcknowledgements() {
+        partitionCache.cachedSharePartitionKeys().forEach(key -> {
+            SharePartition partition = partitionCache.get(key);
+            if (partition != null) {
+                partition.reconcileTransactionalAcknowledgements();
+            }
+        });
     }
 
     /**
@@ -624,9 +693,8 @@ public class SharePartitionManager implements AutoCloseable {
      * @param shareVersion the new share version feature
      */
     public void onShareVersionToggle(ShareVersion shareVersion) {
-        // Clear the cache and remove all share partitions from the cache if the share version does
-        // not support share groups.
-        if (!shareVersion.supportsShareGroups()) {
+        boolean transactionalAcks = shareVersion.supportsTransactionalAcknowledgements();
+        if (!shareVersion.supportsShareGroups() || transactionalAcks != transactionalAcksActive) {
             cache.removeAllSessions();
             Set<SharePartitionKey> sharePartitionKeys = partitionCache.cachedSharePartitionKeys();
             // Remove all share partitions from partition cache.
@@ -634,6 +702,7 @@ public class SharePartitionManager implements AutoCloseable {
                 removeSharePartitionFromCache(sharePartitionKey, partitionCache, metadataProvider, delayedRequestNotifier)
             );
         }
+        transactionalAcksActive = transactionalAcks;
     }
 
     /**
@@ -780,7 +849,8 @@ public class SharePartitionManager implements AutoCloseable {
                             configProvider,
                             listener,
                             shareGroupDlqEnableSupplier,
-                            shareGroupDLQManager
+                            shareGroupDLQManager,
+                            transactionalAcksEnabled
                     );
                 });
     }
@@ -812,8 +882,7 @@ public class SharePartitionManager implements AutoCloseable {
      */
     private BiConsumer<SharePartitionKey, Throwable> fencedSharePartitionHandler() {
         return (sharePartitionKey, throwable) -> {
-            if (throwable instanceof NotLeaderOrFollowerException || throwable instanceof FencedStateEpochException ||
-                throwable instanceof GroupIdNotFoundException || throwable instanceof UnknownTopicOrPartitionException) {
+            if (isFencedSharePartitionError(throwable)) {
                 log.info("The share partition with key {} is fenced: {}", sharePartitionKey, throwable.getMessage());
                 // The share partition is fenced hence remove the partition from map and let the client retry.
                 // But surface the error to the client so client might take some action i.e. re-fetch
@@ -821,6 +890,11 @@ public class SharePartitionManager implements AutoCloseable {
                 removeSharePartitionFromCache(sharePartitionKey, partitionCache, metadataProvider, delayedRequestNotifier);
             }
         };
+    }
+
+    private static boolean isFencedSharePartitionError(Throwable error) {
+        return error instanceof NotLeaderOrFollowerException || error instanceof FencedStateEpochException ||
+            error instanceof GroupIdNotFoundException || error instanceof UnknownTopicOrPartitionException;
     }
 
     private SharePartitionKey sharePartitionKey(String groupId, TopicIdPartition topicIdPartition) {
@@ -840,7 +914,15 @@ public class SharePartitionManager implements AutoCloseable {
         PartitionMetadataProvider metadataProvider,
         Consumer<DelayedShareFetchKey> delayedRequestNotifier
     ) {
-        SharePartition sharePartition = partitionCache.remove(sharePartitionKey);
+        closeRemovedSharePartition(sharePartitionKey, partitionCache.remove(sharePartitionKey), metadataProvider, delayedRequestNotifier);
+    }
+
+    private static void closeRemovedSharePartition(
+        SharePartitionKey sharePartitionKey,
+        SharePartition sharePartition,
+        PartitionMetadataProvider metadataProvider,
+        Consumer<DelayedShareFetchKey> delayedRequestNotifier
+    ) {
         if (sharePartition != null) {
             sharePartition.markFenced();
             metadataProvider.removePartitionListener(sharePartitionKey.topicIdPartition(), sharePartition.listener());

@@ -19,9 +19,11 @@ package org.apache.kafka.server.share.persister;
 
 import org.apache.kafka.clients.KafkaClient;
 import org.apache.kafka.clients.MockClient;
+import org.apache.kafka.clients.NodeApiVersions;
 import org.apache.kafka.common.Node;
 import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.internals.Topic;
 import org.apache.kafka.common.message.DeleteShareGroupStateRequestData;
 import org.apache.kafka.common.message.FindCoordinatorResponseData;
 import org.apache.kafka.common.message.InitializeShareGroupStateRequestData;
@@ -48,6 +50,7 @@ import org.apache.kafka.server.share.SharePartitionKey;
 import org.apache.kafka.server.util.MockTime;
 import org.apache.kafka.server.util.timer.MockTimer;
 import org.apache.kafka.server.util.timer.Timer;
+import org.apache.kafka.test.TestUtils;
 
 import org.junit.jupiter.api.Test;
 
@@ -60,11 +63,13 @@ import java.util.concurrent.TimeUnit;
 
 import static org.apache.kafka.test.TestUtils.assertFutureThrows;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 class DefaultStatePersisterTest {
     private static final KafkaClient CLIENT = mock(KafkaClient.class);
@@ -660,6 +665,49 @@ class DefaultStatePersisterTest {
 
         assertEquals(2, result.topicsData().size());
         assertEquals(expectedResultMap, resultMap);
+    }
+
+    @Test
+    public void testTransactionalStateWriteRetriesTheSameIntent() throws Exception {
+        MockTime time = new MockTime();
+        MockTimer timer = new MockTimer(time);
+        MockClient client = new MockClient(time);
+        client.setNodeApiVersions(NodeApiVersions.create(ApiKeys.WRITE_SHARE_GROUP_STATE.id, (short) 0, (short) 3));
+        Node coordinator = new Node(1, HOST, PORT);
+        SharePartitionKey key = SharePartitionKey.getInstance("group", Uuid.randomUuid(), 0);
+        ShareCoordinatorMetadataCacheHelper cache = mock(ShareCoordinatorMetadataCacheHelper.class);
+        when(cache.containsTopic(Topic.SHARE_GROUP_STATE_TOPIC_NAME)).thenReturn(true);
+        when(cache.getShareCoordinator(key, Topic.SHARE_GROUP_STATE_TOPIC_NAME)).thenReturn(coordinator);
+        var partition = new WriteShareGroupStateRequestData.PartitionData()
+            .setPartition(key.partition())
+            .setStateEpoch(3)
+            .setLeaderEpoch(4)
+            .setStartOffset(-1)
+            .setDeliveryCompleteCount(-1)
+            .setStateIncarnationId(Uuid.randomUuid())
+            .setWriterGeneration(Uuid.randomUuid())
+            .setStateBatches(List.of(new WriteShareGroupStateRequestData.StateBatch()
+                .setFirstOffset(42).setLastOffset(42).setDeliveryCount((short) 1).setDeliveryState((byte) 2)));
+        var expected = new WriteShareGroupStateRequestData().setGroupId(key.groupId())
+            .setTransactionalId("task").setProducerId(5).setProducerEpoch((short) 7)
+            .setTopics(List.of(new WriteShareGroupStateRequestData.WriteStateData()
+                .setTopicId(key.topicId()).setPartitions(List.of(partition))));
+        MockClient.RequestMatcher sameIntent = request -> request.version() == 3 && expected.equals(request.data());
+        client.prepareResponseFrom(sameIntent, new WriteShareGroupStateResponse(WriteShareGroupStateResponse.toErrorResponseData(
+            key.topicId(), key.partition(), Errors.CONCURRENT_TRANSACTIONS, null)), coordinator);
+        client.prepareResponseFrom(sameIntent, new WriteShareGroupStateResponse(WriteShareGroupStateResponse.toResponseData(
+            key.topicId(), key.partition())), coordinator);
+
+        DefaultStatePersister persister = DefaultStatePersister.instance(client, cache, time, timer);
+        try {
+            CompletableFuture<Void> result = persister.writeFencedState(key, partition, "task", 5, (short) 7);
+            TestUtils.waitForCondition(() -> timer.size() == 1, "The transactional write did not schedule a retry");
+            assertFalse(result.isDone());
+            assertTrue(timer.advanceClock(PersisterStateManager.REQUEST_BACKOFF_MAX_MS + 1));
+            result.get(10L, TimeUnit.SECONDS);
+        } finally {
+            persister.stop();
+        }
     }
 
     @Test

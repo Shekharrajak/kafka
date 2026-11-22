@@ -16,6 +16,7 @@
  */
 package org.apache.kafka.clients.consumer;
 
+import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.Metric;
 import org.apache.kafka.common.MetricName;
@@ -39,6 +40,15 @@ import java.util.Set;
  */
 @InterfaceAudience.Public
 public interface ShareConsumer<K, V> extends Closeable {
+
+    /**
+     * Binds the producer that commits acknowledgements in transactional acknowledgement mode.
+     *
+     * @param producer the transactional producer
+     */
+    default void setTransactionContextProvider(KafkaProducer<?, ?> producer) {
+        throw new UnsupportedOperationException("Transactional acknowledgements are not supported by this consumer");
+    }
 
     /**
      * @see KafkaShareConsumer#subscription()

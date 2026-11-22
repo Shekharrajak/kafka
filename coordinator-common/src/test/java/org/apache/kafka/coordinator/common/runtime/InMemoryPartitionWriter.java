@@ -130,7 +130,7 @@ public class InMemoryPartitionWriter implements PartitionWriter {
         String transactionalId,
         long producerId,
         short producerEpoch,
-        int apiVersion
+        TransactionVerificationMode mode
     ) throws KafkaException {
         return CompletableFuture.completedFuture(new VerificationGuard());
     }

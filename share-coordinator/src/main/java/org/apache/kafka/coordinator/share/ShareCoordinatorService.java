@@ -38,6 +38,7 @@ import org.apache.kafka.common.requests.InitializeShareGroupStateResponse;
 import org.apache.kafka.common.requests.ReadShareGroupStateResponse;
 import org.apache.kafka.common.requests.ReadShareGroupStateSummaryResponse;
 import org.apache.kafka.common.requests.RequestContext;
+import org.apache.kafka.common.requests.TransactionResult;
 import org.apache.kafka.common.requests.WriteShareGroupStateResponse;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.common.utils.Utils;
@@ -45,6 +46,7 @@ import org.apache.kafka.common.utils.internals.LogContext;
 import org.apache.kafka.coordinator.common.runtime.CoordinatorEventProcessor;
 import org.apache.kafka.coordinator.common.runtime.CoordinatorLoader;
 import org.apache.kafka.coordinator.common.runtime.CoordinatorRecord;
+import org.apache.kafka.coordinator.common.runtime.CoordinatorResult;
 import org.apache.kafka.coordinator.common.runtime.CoordinatorRuntime;
 import org.apache.kafka.coordinator.common.runtime.CoordinatorRuntimeMetrics;
 import org.apache.kafka.coordinator.common.runtime.CoordinatorShardBuilderSupplier;
@@ -70,6 +72,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -77,6 +80,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BiConsumer;
 import java.util.function.IntSupplier;
 
 import static org.apache.kafka.coordinator.common.runtime.CoordinatorOperationExceptionHelper.handleOperationException;
@@ -130,6 +134,7 @@ public class ShareCoordinatorService implements ShareCoordinator {
      * and utilized in the periodic snapshot job.
      */
     private final PartitionWriter writer;
+    private final BiConsumer<ShareCoordinatorShard.TransactionCompletion, TransactionResult> transactionCompletionListener;
 
     /**
      * Cache used to optimize calls to clean up __share_group_state. Presence of same entry in the cache helps prevent
@@ -148,6 +153,7 @@ public class ShareCoordinatorService implements ShareCoordinator {
         private final int nodeId;
         private final ShareCoordinatorConfig config;
         private PartitionWriter writer;
+        private BiConsumer<ShareCoordinatorShard.TransactionCompletion, TransactionResult> transactionCompletionListener;
         private CoordinatorLoader<CoordinatorRecord> loader;
         private Time time;
         private Timer timer;
@@ -157,6 +163,13 @@ public class ShareCoordinatorService implements ShareCoordinator {
         public Builder(int nodeId, ShareCoordinatorConfig config) {
             this.nodeId = nodeId;
             this.config = config;
+        }
+
+        public Builder withTransactionCompletionListener(
+            BiConsumer<ShareCoordinatorShard.TransactionCompletion, TransactionResult> listener
+        ) {
+            this.transactionCompletionListener = listener;
+            return this;
         }
 
         public Builder withWriter(PartitionWriter writer) {
@@ -254,7 +267,8 @@ public class ShareCoordinatorService implements ShareCoordinator {
                 coordinatorMetrics,
                 time,
                 timer,
-                writer
+                writer,
+                transactionCompletionListener
             );
         }
     }
@@ -268,6 +282,19 @@ public class ShareCoordinatorService implements ShareCoordinator {
         Timer timer,
         PartitionWriter writer
     ) {
+        this(logContext, config, runtime, shareCoordinatorMetrics, time, timer, writer, null);
+    }
+
+    public ShareCoordinatorService(
+        LogContext logContext,
+        ShareCoordinatorConfig config,
+        CoordinatorRuntime<ShareCoordinatorShard, CoordinatorRecord> runtime,
+        ShareCoordinatorMetrics shareCoordinatorMetrics,
+        Time time,
+        Timer timer,
+        PartitionWriter writer,
+        BiConsumer<ShareCoordinatorShard.TransactionCompletion, TransactionResult> transactionCompletionListener
+    ) {
         this.log = logContext.logger(ShareCoordinatorService.class);
         this.config = config;
         this.runtime = runtime;
@@ -275,6 +302,7 @@ public class ShareCoordinatorService implements ShareCoordinator {
         this.time = time;
         this.timer = timer;
         this.writer = writer;
+        this.transactionCompletionListener = transactionCompletionListener;
         this.lastPrunedOffsets = new ConcurrentHashMap<>();
     }
 
@@ -292,6 +320,7 @@ public class ShareCoordinatorService implements ShareCoordinator {
         // As defined in KIP-932.
         return Map.of(
             TopicConfig.CLEANUP_POLICY_CONFIG, TopicConfig.CLEANUP_POLICY_DELETE,
+            TopicConfig.UNCLEAN_LEADER_ELECTION_ENABLE_CONFIG, "false",
             TopicConfig.COMPRESSION_TYPE_CONFIG, BrokerCompressionType.PRODUCER.name,
             TopicConfig.SEGMENT_BYTES_CONFIG, String.valueOf(config.shareCoordinatorStateTopicSegmentBytes()),
             TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG, String.valueOf(config.shareCoordinatorStateTopicMinIsr()),
@@ -508,6 +537,9 @@ public class ShareCoordinatorService implements ShareCoordinator {
             );
         }
 
+        Optional<WriteShareGroupStateResponseData> transactionError = validateWriteTransaction(context, request);
+        if (transactionError.isPresent()) return CompletableFuture.completedFuture(transactionError.get());
+
         // The request received here could have multiple keys of structure group:topic:partition. However,
         // the writeState method in ShareCoordinatorShard expects a single key in the request. Hence, we will
         // be looping over the keys below and constructing new WriteShareGroupStateRequestData objects to pass
@@ -520,20 +552,14 @@ public class ShareCoordinatorService implements ShareCoordinator {
                 futureMap.computeIfAbsent(topicData.topicId(), k -> new HashMap<>());
             topicData.partitions().forEach(
                 partitionData -> {
-                    CompletableFuture<WriteShareGroupStateResponseData> future = runtime.scheduleWriteOperation(
-                            "write-share-group-state",
-                            topicPartitionFor(SharePartitionKey.getInstance(groupId, topicData.topicId(), partitionData.partition())),
-                            coordinator -> coordinator.writeState(new WriteShareGroupStateRequestData()
-                                .setGroupId(groupId)
-                                .setTopics(List.of(new WriteShareGroupStateRequestData.WriteStateData()
-                                    .setTopicId(topicData.topicId())
-                                    .setPartitions(List.of(new WriteShareGroupStateRequestData.PartitionData()
-                                        .setPartition(partitionData.partition())
-                                        .setStartOffset(partitionData.startOffset())
-                                        .setDeliveryCompleteCount(partitionData.deliveryCompleteCount())
-                                        .setLeaderEpoch(partitionData.leaderEpoch())
-                                        .setStateEpoch(partitionData.stateEpoch())
-                                        .setStateBatches(partitionData.stateBatches())))))))
+                    WriteShareGroupStateRequestData partitionRequest = new WriteShareGroupStateRequestData()
+                        .setGroupId(groupId).setTransactionalId(request.transactionalId())
+                        .setProducerId(request.producerId()).setProducerEpoch(request.producerEpoch())
+                        .setTopics(List.of(new WriteShareGroupStateRequestData.WriteStateData()
+                            .setTopicId(topicData.topicId()).setPartitions(List.of(partitionData.duplicate()))));
+                    CompletableFuture<WriteShareGroupStateResponseData> writeFuture = scheduleStateWrite(
+                        partitionRequest, topicData.topicId(), partitionData.partition());
+                    CompletableFuture<WriteShareGroupStateResponseData> future = writeFuture
                         .exceptionally(exception -> handleOperationException(
                             "write-share-group-state",
                             request,
@@ -583,6 +609,77 @@ public class ShareCoordinatorService implements ShareCoordinator {
             return new WriteShareGroupStateResponseData()
                 .setResults(writeStateResults);
         });
+    }
+
+    private Optional<WriteShareGroupStateResponseData> validateWriteTransaction(
+        RequestContext context,
+        WriteShareGroupStateRequestData request
+    ) {
+        if (invalidTransactionIdentity(request)) {
+            return Optional.of(generateErrorWriteStateResponse(
+                request, Errors.INVALID_REQUEST, "Transaction identity must be complete"));
+        }
+        if (request.transactionalId() != null && context != null && context.requestVersion() < 3) {
+            return Optional.of(generateErrorWriteStateResponse(
+                request, Errors.UNSUPPORTED_VERSION, "Transactional share writes require version 3"));
+        }
+        return Optional.empty();
+    }
+
+    private static boolean invalidTransactionIdentity(WriteShareGroupStateRequestData request) {
+        if (request.transactionalId() == null) return request.producerId() != -1 || request.producerEpoch() != -1;
+        return request.transactionalId().isEmpty() || request.producerId() < 0 ||
+            request.producerEpoch() < 0 || request.producerEpoch() == Short.MAX_VALUE;
+    }
+
+    private CompletableFuture<WriteShareGroupStateResponseData> scheduleStateWrite(
+        WriteShareGroupStateRequestData request,
+        Uuid topicId,
+        int partition
+    ) {
+        TopicPartition statePartition = topicPartitionFor(SharePartitionKey.getInstance(request.groupId(), topicId, partition));
+        if (request.transactionalId() != null) {
+            return runtime.scheduleTransactionalWriteOperation("write-transactional-share-group-state", statePartition,
+                request.transactionalId(), request.producerId(), request.producerEpoch(),
+                coordinator -> coordinator.writeState(request), PartitionWriter.TransactionVerificationMode.ADD_PARTITION);
+        }
+        return runtime.scheduleWriteOperation("write-share-group-state", statePartition, coordinator -> coordinator.writeState(request));
+    }
+
+    @Override
+    public CompletableFuture<Void> completeTransaction(
+        TopicPartition tp,
+        long producerId,
+        short markerEpoch,
+        int coordinatorEpoch,
+        TransactionResult result,
+        short transactionVersion
+    ) {
+        if (!isActive.get()) return CompletableFuture.failedFuture(Errors.COORDINATOR_NOT_AVAILABLE.exception());
+        if (!Topic.SHARE_GROUP_STATE_TOPIC_NAME.equals(tp.topic())) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException("Expected a share-state partition"));
+        }
+        CompletableFuture<Void> durable = runtime.scheduleTransactionCompletion("complete-share-transaction", tp, producerId,
+            markerEpoch, coordinatorEpoch, result, transactionVersion);
+        if (transactionCompletionListener != null && markerEpoch > 0) {
+            durable.whenComplete((ignored, markerError) -> {
+                if (markerError != null) return;
+                runtime.scheduleWriteOperation("read-share-transaction-completion", tp,
+                    coordinator -> new CoordinatorResult<>(List.of(),
+                        coordinator.transactionCompletion(producerId, (short) (markerEpoch - 1))))
+                    .whenComplete((completion, readError) -> {
+                        if (readError != null) return;
+                        completion.ifPresent(value -> {
+                            try {
+                                transactionCompletionListener.accept(value, result);
+                            } catch (RuntimeException error) {
+                                log.debug("Unable to send share transaction completion hint", error);
+                            }
+                        });
+                    });
+            });
+        }
+        return durable;
     }
 
     @Override
@@ -657,19 +754,30 @@ public class ShareCoordinatorService implements ShareCoordinator {
                     "read-update-leader-epoch-state",
                     topicPartitionFor(coordinatorKey),
                     coordinator -> coordinator.readStateAndMaybeUpdateLeaderEpoch(requestForCurrentPartition)
-                ).exceptionally(readException ->
-                    handleOperationException(
+                ).thenApply(response -> {
+                    ReadShareGroupStateResponseData.PartitionResult partition = response.results().get(0).partitions().get(0);
+                    if (context != null && context.requestVersion() < 2 &&
+                            (!Uuid.ZERO_UUID.equals(partition.stateIncarnationId()) ||
+                                !Uuid.ZERO_UUID.equals(partition.writerGeneration()) || !partition.pendingTransactions().isEmpty())) {
+                        return ReadShareGroupStateResponse.toErrorResponseData(topicId, partitionData.partition(),
+                            Errors.UNSUPPORTED_VERSION, "Transactional share state requires read version 2");
+                    }
+                    return response;
+                }).exceptionally(readException -> {
+                    Throwable cause = Errors.maybeUnwrapException(readException);
+                    return handleOperationException(
                         "read-update-leader-epoch-state",
                         request,
-                        readException,
+                        cause,
                         (error, message) -> ReadShareGroupStateResponse.toErrorResponseData(
                             topicData.topicId(),
                             partitionData.partition(),
                             error,
-                            "Unable to read share group state: " + readException.getMessage()
+                            "Unable to read share group state: " + cause.getMessage()
                         ),
                         log
-                    ));
+                    );
+                });
 
                 futureMap.computeIfAbsent(topicId, k -> new HashMap<>())
                     .put(partitionData.partition(), readFuture);

@@ -1,0 +1,138 @@
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements.  See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to You under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance with
+// the License.  You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+
+{
+  // Experimental API ID, pending upstream allocation.
+  "apiKey": 95,
+  "type": "request",
+  "listeners": [
+    "broker"
+  ],
+  "name": "TxnShareAcknowledgeRequest",
+  "validVersions": "0",
+  "flexibleVersions": "0+",
+  "latestVersionUnstable": true,
+  "headerVersions": {
+    "0+": "3"
+  },
+  "fields": [
+    {
+      "name": "TransactionalId",
+      "type": "string",
+      "versions": "0+",
+      "nullableVersions": "0+",
+      "about": "The transactional ID.",
+      "entityType": "transactionalId"
+    },
+    {
+      "name": "GroupId",
+      "type": "string",
+      "versions": "0+",
+      "entityType": "groupId",
+      "nullableVersions": "0+",
+      "default": "null",
+      "about": "The share group identifier."
+    },
+    {
+      "name": "ProducerId",
+      "type": "int64",
+      "versions": "0+",
+      "about": "The producer ID associated with the transaction.",
+      "entityType": "producerId"
+    },
+    {
+      "name": "ProducerEpoch",
+      "type": "int16",
+      "versions": "0+",
+      "about": "The original producer epoch used when the acknowledgements were staged."
+    },
+    {
+      "name": "MemberId",
+      "type": "string",
+      "versions": "0+",
+      "nullableVersions": "0+",
+      "about": "The share group member ID."
+    },
+    {
+      "name": "ShareSessionEpoch",
+      "type": "int32",
+      "versions": "0+",
+      "about": "The current share session epoch."
+    },
+    {
+      "name": "Topics",
+      "type": "[]TxnAcknowledgeTopic",
+      "versions": "0+",
+      "fields": [
+        {
+          "name": "TopicId",
+          "type": "uuid",
+          "versions": "0+",
+          "mapKey": true,
+          "about": "The topic ID."
+        },
+        {
+          "name": "Partitions",
+          "type": "[]TxnAcknowledgePartition",
+          "versions": "0+",
+          "fields": [
+            {
+              "name": "PartitionIndex",
+              "type": "int32",
+              "versions": "0+",
+              "mapKey": true,
+              "about": "The partition index."
+            },
+            {
+              "name": "AcknowledgementBatches",
+              "type": "[]AcknowledgementBatch",
+              "versions": "0+",
+              "fields": [
+                {
+                  "name": "FirstOffset",
+                  "type": "int64",
+                  "versions": "0+",
+                  "about": "The first offset of this acknowledgement batch."
+                },
+                {
+                  "name": "LastOffset",
+                  "type": "int64",
+                  "versions": "0+",
+                  "about": "The last offset of this acknowledgement batch, inclusive."
+                },
+                {
+                  "name": "AcquisitionId",
+                  "type": "uuid",
+                  "versions": "0+",
+                  "about": "Experimental identity of the acquisition containing this acknowledged range."
+                },
+                {
+                  "name": "AcknowledgeTypes",
+                  "type": "[]int8",
+                  "versions": "0+",
+                  "about": "Acknowledgement types: 0 GAP, 1 ACCEPT, or 3 REJECT; RELEASE and RENEW are not supported."
+                }
+              ],
+              "about": "The acquired ranges to acknowledge."
+            }
+          ],
+          "about": "The partitions containing records to acknowledge."
+        }
+      ],
+      "about": "The topics containing records to acknowledge."
+    }
+  ]
+}

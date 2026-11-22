@@ -2435,7 +2435,7 @@ public class GroupCoordinatorService implements GroupCoordinator {
             request.producerId(),
             request.producerEpoch(),
             coordinator -> coordinator.commitTransactionalOffset(context, request),
-            context.requestVersion()
+            PartitionWriter.TransactionVerificationMode.forTxnOffsetCommitVersion(context.requestVersion())
         ).exceptionally(exception -> handleOperationException(
             "txn-commit-offset",
             request,

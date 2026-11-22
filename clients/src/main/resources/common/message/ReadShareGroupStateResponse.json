@@ -18,7 +18,8 @@
   "type": "response",
   "name": "ReadShareGroupStateResponse",
   // Version 1 is the same as version 0 (KIP-1313).
-  "validVersions": "0-1",
+  // Version 2 returns pending transactional ACKs and writer fencing information (KIP-1289).
+  "validVersions": "0-2",
   "flexibleVersions": "0+",
   "headerVersions": {
     "0+": "1"
@@ -48,17 +49,35 @@
         { "name": "StartOffset", "type": "int64", "versions": "0+",
           "about": "The share-partition start offset, which can be -1 if it is not yet initialized." },
         { "name": "StateBatches", "type": "[]StateBatch", "versions": "0+",
-          "about": "The state batches for this share-partition.", "fields":[
-          { "name": "FirstOffset", "type": "int64", "versions": "0+",
-            "about": "The first offset of this state batch." },
-          { "name": "LastOffset", "type": "int64", "versions": "0+",
-            "about": "The last offset of this state batch." },
-          { "name": "DeliveryState", "type": "int8", "versions": "0+",
-            "about": "The delivery state - 0:Available,2:Acked,4:Archived." },
-          { "name": "DeliveryCount", "type": "int16", "versions": "0+",
-            "about": "The delivery count." }
+          "about": "The committed state batches for this share-partition." },
+        { "name": "StateIncarnationId", "type": "uuid", "versions": "2+",
+          "about": "The identity of the current logical share state, or zero if transactional state has not been initialized." },
+        { "name": "WriterGeneration", "type": "uuid", "versions": "2+",
+          "about": "The current writer generation, or zero if no generation has been assigned." },
+        { "name": "PendingTransactions", "type": "[]PendingTransaction", "versions": "2+",
+          "about": "Durably staged transitions awaiting a transaction outcome.", "fields": [
+          { "name": "TransactionalId", "type": "string", "versions": "2+",
+            "about": "The transactional ID." },
+          { "name": "ProducerId", "type": "int64", "versions": "2+",
+            "about": "The producer ID that staged these transitions." },
+          { "name": "ProducerEpoch", "type": "int16", "versions": "2+",
+            "about": "The producer epoch used to stage these transitions." },
+          { "name": "StateBatches", "type": "[]StateBatch", "versions": "2+",
+            "about": "The intended states of the offsets held by this transaction." }
         ]}
       ]}
+    ]}
+  ],
+  "commonStructs": [
+    { "name": "StateBatch", "versions": "0+", "fields": [
+      { "name": "FirstOffset", "type": "int64", "versions": "0+",
+        "about": "The first offset of this state batch." },
+      { "name": "LastOffset", "type": "int64", "versions": "0+",
+        "about": "The last offset of this state batch." },
+      { "name": "DeliveryState", "type": "int8", "versions": "0+",
+        "about": "The delivery state." },
+      { "name": "DeliveryCount", "type": "int16", "versions": "0+",
+        "about": "The delivery count." }
     ]}
   ]
 }

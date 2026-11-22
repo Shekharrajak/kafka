@@ -22,7 +22,8 @@
   // Version 1 introduces DeliveryCompleteCount in the request (KIP-1226).
   //
   // Version 2 is the same as version 1 (KIP-1313).
-  "validVersions": "0-2",
+  // Version 3 has the same response fields as version 2 (KIP-1289).
+  "validVersions": "0-3",
   "flexibleVersions": "0+",
   "headerVersions": {
     "0+": "1"

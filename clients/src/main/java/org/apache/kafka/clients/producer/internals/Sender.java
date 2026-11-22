@@ -294,6 +294,9 @@ public class Sender implements Runnable {
             log.debug("Aborting incomplete batches due to forced shutdown");
             this.accumulator.abortIncompleteBatches();
         }
+        if (transactionManager != null) {
+            transactionManager.runShareTransactionCallbacks();
+        }
         try {
             this.client.close();
         } catch (Exception e) {
@@ -310,6 +313,7 @@ public class Sender implements Runnable {
     void runOnce() {
         if (transactionManager != null) {
             try {
+                transactionManager.runShareTransactionCallbacks();
                 transactionManager.maybeResolveSequences();
 
                 RuntimeException lastError = transactionManager.lastError();

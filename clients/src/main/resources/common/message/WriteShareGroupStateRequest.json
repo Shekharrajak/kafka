@@ -23,7 +23,9 @@
   // Version 1 introduces DeliveryCompleteCount (KIP-1226).
   //
   // Version 2 uses the v3 request header (KIP-1313).
-  "validVersions": "0-2",
+  // Version 3 supports transactional share state and writer fencing (KIP-1289).
+  "validVersions": "0-3",
+  "latestVersionUnstable": true,
   "flexibleVersions": "0+",
   "headerVersions": {
     "0-1": "2",
@@ -32,6 +34,12 @@
   "fields": [
     { "name": "GroupId", "type": "string", "versions": "0+",
       "about": "The group identifier." },
+    { "name": "TransactionalId", "type": "string", "versions": "3+", "nullableVersions": "3+", "default": "null",
+      "about": "The transactional ID, or null for an ordinary write." },
+    { "name": "ProducerId", "type": "int64", "versions": "3+", "default": "-1",
+      "about": "The producer ID for a transactional write." },
+    { "name": "ProducerEpoch", "type": "int16", "versions": "3+", "default": "-1",
+      "about": "The producer epoch for a transactional write." },
     { "name": "Topics", "type": "[]WriteStateData", "versions": "0+",
       "about": "The data for the topics.", "fields": [
       { "name": "TopicId", "type": "uuid", "versions": "0+",
@@ -44,6 +52,10 @@
           "about": "The state epoch of the share-partition." },
         { "name": "LeaderEpoch", "type": "int32", "versions": "0+",
           "about": "The leader epoch of the share-partition." },
+        { "name": "StateIncarnationId", "type": "uuid", "versions": "3+",
+          "about": "The logical share state the writer is updating." },
+        { "name": "WriterGeneration", "type": "uuid", "versions": "3+",
+          "about": "The generation assigned to the current share-state writer." },
         { "name": "StartOffset", "type": "int64", "versions": "0+",
           "about": "The share-partition start offset, or -1 if the start offset is not being written." },
         { "name": "DeliveryCompleteCount", "type": "int32", "versions": "1+", "ignorable": true, "default": "-1",

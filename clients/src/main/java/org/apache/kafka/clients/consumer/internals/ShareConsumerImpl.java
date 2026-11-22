@@ -50,6 +50,8 @@ import org.apache.kafka.clients.consumer.internals.events.ShareUnsubscribeEvent;
 import org.apache.kafka.clients.consumer.internals.events.StopFindCoordinatorOnCloseEvent;
 import org.apache.kafka.clients.consumer.internals.metrics.AsyncConsumerMetrics;
 import org.apache.kafka.clients.consumer.internals.metrics.KafkaShareConsumerMetrics;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.internals.ShareTransactionParticipant;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.Metric;
 import org.apache.kafka.common.MetricName;
@@ -87,6 +89,7 @@ import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
@@ -186,6 +189,9 @@ public class ShareConsumerImpl<K, V> implements ShareConsumerDelegate<K, V> {
     private AcknowledgementCommitCallbackHandler acknowledgementCommitCallbackHandler;
     private final List<Map<TopicIdPartition, Acknowledgements>> completedAcknowledgements;
     private final ShareAcknowledgementMode acknowledgementMode;
+    private ShareConsumerTransactionParticipant transactionParticipant;
+    private ShareTransactionParticipant.Registration transactionRegistration;
+    private KafkaProducer<?, ?> transactionContextProvider;
 
     /**
      * A thread-safe {@link ShareFetchBuffer fetch buffer} for the results that are populated in the
@@ -577,6 +583,7 @@ public class ShareConsumerImpl<K, V> implements ShareConsumerDelegate<K, V> {
     public void unsubscribe() {
         acquireAndEnsureOpen();
         try {
+            ensureNoPendingTransaction();
             Timer timer = time.timer(defaultApiTimeoutMs);
             ShareUnsubscribeEvent unsubscribeApplicationEvent = new ShareUnsubscribeEvent(calculateDeadlineMs(timer));
             applicationEventHandler.addAndGet(unsubscribeApplicationEvent);
@@ -597,6 +604,7 @@ public class ShareConsumerImpl<K, V> implements ShareConsumerDelegate<K, V> {
 
         acquireAndEnsureOpen();
         try {
+            ensureTransactionalPollAllowed();
             // Throw any errors notified by the background thread
             processBackgroundEvents();
 
@@ -702,7 +710,7 @@ public class ShareConsumerImpl<K, V> implements ShareConsumerDelegate<K, V> {
     private ShareFetch<K, V> pollForFetches(final Timer timer) {
         long pollTimeout = Math.min(applicationEventHandler.maximumTimeToWait(), timer.remainingMs());
 
-        Map<TopicIdPartition, NodeAcknowledgements> acknowledgementsMap = currentFetch.takeAcknowledgedRecords();
+        Map<TopicIdPartition, NodeAcknowledgements> acknowledgementsMap = acknowledgementsToSend();
 
         // If data is available already, return it immediately
         final ShareFetch<K, V> fetch = collect(acknowledgementsMap);
@@ -734,7 +742,7 @@ public class ShareConsumerImpl<K, V> implements ShareConsumerDelegate<K, V> {
             final ShareFetch<K, V> fetch = fetchCollector.collect(fetchBuffer);
             if (fetch.isEmpty()) {
                 // Check for any acknowledgements which could have come from control records (GAP) and send them.
-                Map<TopicIdPartition, NodeAcknowledgements> controlRecordAcknowledgements = fetch.takeAcknowledgedRecords();
+                Map<TopicIdPartition, NodeAcknowledgements> controlRecordAcknowledgements = drainAcknowledgements(fetch);
                 if (!controlRecordAcknowledgements.isEmpty()) {
                     // Asynchronously commit any waiting acknowledgements from control records.
                     sendShareAcknowledgeAsyncEvent(controlRecordAcknowledgements);
@@ -803,7 +811,11 @@ public class ShareConsumerImpl<K, V> implements ShareConsumerDelegate<K, V> {
         acquireAndEnsureOpen();
         try {
             ensureExplicitAcknowledgement();
-            currentFetch.acknowledge(record, type);
+            if (acknowledgementMode == ShareAcknowledgementMode.TRANSACTIONAL) {
+                acknowledgeTransactional(record, type);
+            } else {
+                currentFetch.acknowledge(record, type);
+            }
         } finally {
             release();
         }
@@ -816,6 +828,7 @@ public class ShareConsumerImpl<K, V> implements ShareConsumerDelegate<K, V> {
         acquireAndEnsureOpen();
         try {
             ensureExplicitAcknowledgement();
+            ensureNonTransactionalCommit();
             currentFetch.acknowledge(topic, partition, offset, type);
         } finally {
             release();
@@ -837,6 +850,7 @@ public class ShareConsumerImpl<K, V> implements ShareConsumerDelegate<K, V> {
     public Map<TopicIdPartition, Optional<KafkaException>> commitSync(final Duration timeout) {
         acquireAndEnsureOpen();
         try {
+            ensureNonTransactionalCommit();
             // Handle any completed acknowledgements for which we already have the responses
             handleCompletedAcknowledgements();
 
@@ -884,6 +898,7 @@ public class ShareConsumerImpl<K, V> implements ShareConsumerDelegate<K, V> {
     public void commitAsync() {
         acquireAndEnsureOpen();
         try {
+            ensureNonTransactionalCommit();
             // Handle any completed acknowledgements for which we already have the responses
             handleCompletedAcknowledgements();
 
@@ -1014,6 +1029,10 @@ public class ShareConsumerImpl<K, V> implements ShareConsumerDelegate<K, V> {
 
     private void close(final Duration timeout, final boolean swallowException) {
         log.trace("Closing the Kafka consumer");
+        if (transactionRegistration != null) {
+            transactionRegistration.close();
+            transactionParticipant.close();
+        }
         AtomicReference<Throwable> firstException = new AtomicReference<>();
 
         // We are already closing with a timeout, don't allow wake-ups from here on.
@@ -1084,7 +1103,7 @@ public class ShareConsumerImpl<K, V> implements ShareConsumerDelegate<K, V> {
             return;
         }
         completeQuietly(
-                () -> applicationEventHandler.addAndGet(new ShareAcknowledgeOnCloseEvent(acknowledgementsToSend(), calculateDeadlineMs(timer))),
+                () -> applicationEventHandler.addAndGet(new ShareAcknowledgeOnCloseEvent(acknowledgementMode == ShareAcknowledgementMode.TRANSACTIONAL ? Map.of() : acknowledgementsToSend(), calculateDeadlineMs(timer))),
                 "Failed to send pending acknowledgements with a timeout(ms)=" + timer.timeoutMs(), firstException);
         timer.update();
 
@@ -1212,7 +1231,7 @@ public class ShareConsumerImpl<K, V> implements ShareConsumerDelegate<K, V> {
      * If the acknowledgement mode is EXPLICIT, ensure that all in-flight records have been acknowledged.
      */
     private void ensureInFlightAcknowledgedIfExplicitAcknowledgement() {
-        if (acknowledgementMode == ShareAcknowledgementMode.EXPLICIT) {
+        if (acknowledgementMode != ShareAcknowledgementMode.IMPLICIT) {
             if (!currentFetch.checkAllInFlightAreAcknowledged()) {
                 // We cannot leave unacknowledged records in EXPLICIT acknowledgement mode, so we throw an exception to the application.
                 throw new IllegalStateException("All records must be acknowledged in explicit acknowledgement mode.");
@@ -1224,7 +1243,80 @@ public class ShareConsumerImpl<K, V> implements ShareConsumerDelegate<K, V> {
      * Returns any ready acknowledgements to be sent to the cluster.
      */
     private Map<TopicIdPartition, NodeAcknowledgements> acknowledgementsToSend() {
-        return currentFetch.takeAcknowledgedRecords();
+        return drainAcknowledgements(currentFetch);
+    }
+
+    private Map<TopicIdPartition, NodeAcknowledgements> drainAcknowledgements(ShareFetch<K, V> fetch) {
+        return acknowledgementMode == ShareAcknowledgementMode.TRANSACTIONAL ? fetch.takeGapAcknowledgements() : fetch.takeAcknowledgedRecords();
+    }
+
+    @Override
+    public void setTransactionContextProvider(KafkaProducer<?, ?> producer) {
+        acquireAndEnsureOpen();
+        try {
+            Objects.requireNonNull(producer, "producer");
+            if (acknowledgementMode != ShareAcknowledgementMode.TRANSACTIONAL) {
+                throw new IllegalStateException("The share acknowledgement mode must be transactional");
+            }
+            if (transactionContextProvider == producer) {
+                return;
+            }
+            if (transactionContextProvider != null) {
+                throw new IllegalStateException("The share consumer already has a transaction context provider");
+            }
+            ShareConsumerTransactionParticipant participant = new ShareConsumerTransactionParticipant(
+                applicationEventHandler, acknowledgementEventHandler, time, defaultApiTimeoutMs);
+            transactionRegistration = producer.registerShareTransactionParticipant(participant);
+            transactionParticipant = participant;
+            transactionContextProvider = producer;
+        } finally {
+            release();
+        }
+    }
+
+    private void acknowledgeTransactional(ConsumerRecord<K, V> record, AcknowledgeType type) {
+        if (type != AcknowledgeType.ACCEPT && type != AcknowledgeType.REJECT) {
+            throw new IllegalArgumentException("Transactional acknowledgements support ACCEPT and REJECT only");
+        }
+        if (transactionRegistration == null) {
+            throw new IllegalStateException("A transaction context provider must be configured");
+        }
+        TransactionalShareAcknowledgement acknowledgement = currentFetch.transactionalAcknowledgement(record, type);
+        ShareTransactionParticipant.Reservation reservation = transactionRegistration.reserve();
+        try {
+            currentFetch.removeTransactionalRecord(record, acknowledgement);
+            transactionParticipant.add(reservation.transaction(), acknowledgement, currentFetch.checkAllInFlightAreAcknowledged());
+            reservation.complete();
+        } catch (RuntimeException e) {
+            acknowledgement.complete();
+            try {
+                reservation.fail(e);
+            } catch (RuntimeException failure) {
+                e.addSuppressed(failure);
+            }
+            throw e;
+        }
+    }
+
+    private void ensureTransactionalPollAllowed() {
+        if (acknowledgementMode == ShareAcknowledgementMode.TRANSACTIONAL) {
+            if (transactionRegistration == null) {
+                throw new IllegalStateException("A transaction context provider must be configured before polling");
+            }
+            ensureNoPendingTransaction();
+        }
+    }
+
+    private void ensureNoPendingTransaction() {
+        if (transactionParticipant != null && transactionParticipant.hasPendingTransaction()) {
+            throw new IllegalStateException("The previous poll unit's producer transaction must complete first");
+        }
+    }
+
+    private void ensureNonTransactionalCommit() {
+        if (acknowledgementMode == ShareAcknowledgementMode.TRANSACTIONAL) {
+            throw new IllegalStateException("The transaction context provider owns transactional acknowledgement commits");
+        }
     }
 
     /**
@@ -1241,7 +1333,12 @@ public class ShareConsumerImpl<K, V> implements ShareConsumerDelegate<K, V> {
      */
     private static ShareAcknowledgementMode initializeAcknowledgementMode(ConsumerConfig config) {
         String s = config.getString(ConsumerConfig.SHARE_ACKNOWLEDGEMENT_MODE_CONFIG);
-        return ShareAcknowledgementMode.fromString(s);
+        ShareAcknowledgementMode mode = ShareAcknowledgementMode.fromString(s);
+        if (mode == ShareAcknowledgementMode.TRANSACTIONAL &&
+            !"record_limit".equals(config.getString(ConsumerConfig.SHARE_ACQUIRE_MODE_CONFIG))) {
+            throw new IllegalArgumentException("Transactional acknowledgement mode requires share.acquire.mode=record_limit");
+        }
+        return mode;
     }
 
     /**

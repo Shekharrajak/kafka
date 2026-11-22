@@ -740,4 +740,14 @@ For a detailed description of spotbugs bug categories, see https://spotbugs.read
         <Bug pattern="AT_NONATOMIC_64BIT_PRIMITIVE"/>
     </Match>
 
+    <Match>
+        <!-- These flags are read and written only by the share consumer application thread. -->
+        <Class name="org.apache.kafka.clients.consumer.internals.ShareInFlightBatch"/>
+        <Or>
+            <Field name="checkForRenewAcknowledgements"/>
+            <Field name="hasCachedException"/>
+        </Or>
+        <Bug pattern="AT_STALE_THREAD_WRITE_OF_PRIMITIVE"/>
+    </Match>
+
 </FindBugsFilter>

@@ -191,6 +191,10 @@ public class ApplicationEventProcessor implements EventProcessor<ApplicationEven
                 process((ShareAcknowledgeAsyncEvent) event);
                 return;
 
+            case SHARE_ACKNOWLEDGE_TRANSACTIONAL:
+                process((ShareAcknowledgeTransactionalEvent) event);
+                return;
+
             case SHARE_SUBSCRIPTION_CHANGE:
                 process((ShareSubscriptionChangeEvent) event);
                 return;
@@ -570,6 +574,15 @@ public class ApplicationEventProcessor implements EventProcessor<ApplicationEven
 
         ShareConsumeRequestManager manager = requestManagers.shareConsumeRequestManager.get();
         manager.commitAsync(event.acknowledgementsMap(), event.deadlineMs());
+    }
+
+    private void process(final ShareAcknowledgeTransactionalEvent event) {
+        if (requestManagers.shareConsumeRequestManager.isEmpty()) {
+            event.future().completeExceptionally(new IllegalStateException("Share request manager is unavailable"));
+            return;
+        }
+        requestManagers.shareConsumeRequestManager.get().acknowledgeTransactional(
+            event.transaction(), event.acknowledgements(), event.deadlineMs()).whenComplete(complete(event.future()));
     }
 
     /**

@@ -45,6 +45,7 @@ import org.apache.kafka.timeline.SnapshotRegistry;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.mockito.ArgumentMatcher;
 
@@ -1175,8 +1176,9 @@ public class CoordinatorRuntimeTest {
         );
     }
 
-    @Test
-    public void testScheduleTransactionalWriteOp() {
+    @ParameterizedTest
+    @EnumSource(PartitionWriter.TransactionVerificationMode.class)
+    public void testScheduleTransactionalWriteOp(PartitionWriter.TransactionVerificationMode mode) {
         MockTimer timer = new MockTimer();
         MockPartitionWriter writer = mock(MockPartitionWriter.class);
         MockCoordinatorShard coordinator = mock(MockCoordinatorShard.class);
@@ -1220,13 +1222,14 @@ public class CoordinatorRuntimeTest {
 
         // Prepare the transaction verification.
         VerificationGuard guard = new VerificationGuard();
+        CompletableFuture<VerificationGuard> verification = new CompletableFuture<>();
         when(writer.maybeStartTransactionVerification(
             TP,
             "transactional-id",
             100L,
             (short) 50,
-            TXN_OFFSET_COMMIT_LATEST_VERSION
-        )).thenReturn(CompletableFuture.completedFuture(guard));
+            mode
+        )).thenReturn(verification);
 
         // Schedule a transactional write.
         runtime.scheduleTransactionalWriteOperation(
@@ -1236,8 +1239,13 @@ public class CoordinatorRuntimeTest {
             100L,
             (short) 50,
             state -> new CoordinatorResult<>(List.of("record1", "record2"), "response"),
-            TXN_OFFSET_COMMIT_LATEST_VERSION
+            mode
         );
+
+        verify(writer, times(0)).append(any(), any(), any(), anyShort());
+        verify(coordinator, times(0)).replay(anyLong(), anyLong(), anyShort(), any());
+
+        verification.complete(guard);
 
         // Verify that the writer got the records with the correct
         // producer id and producer epoch.
@@ -1317,7 +1325,7 @@ public class CoordinatorRuntimeTest {
             "transactional-id",
             100L,
             (short) 50,
-            TXN_OFFSET_COMMIT_LATEST_VERSION
+            PartitionWriter.TransactionVerificationMode.ADD_PARTITION
         )).thenReturn(CompletableFuture.failedFuture(Errors.NOT_ENOUGH_REPLICAS.exception()));
 
         // Schedule a transactional write.

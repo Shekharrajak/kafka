@@ -43,6 +43,11 @@ public class ShareFetchRequest extends AbstractRequest {
             this.data = data;
         }
 
+        public Builder(ShareFetchRequestData data, short oldestAllowedVersion, short latestAllowedVersion) {
+            super(ApiKeys.SHARE_FETCH, oldestAllowedVersion, latestAllowedVersion);
+            this.data = data;
+        }
+
         public static Builder forConsumer(String groupId, ShareRequestMetadata metadata,
                                           int maxWait, int minBytes, int maxBytes, int maxRecords,
                                           int batchSize, byte shareAcquireMode, boolean isRenewAck,

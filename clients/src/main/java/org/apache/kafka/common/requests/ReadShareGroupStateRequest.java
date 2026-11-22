@@ -38,9 +38,17 @@ public class ReadShareGroupStateRequest extends AbstractRequest {
          * @param requestHeaderVersion the latest request header version which may be used
          */
         public Builder(ReadShareGroupStateRequestData data, short requestHeaderVersion) {
-            super(ApiKeys.READ_SHARE_GROUP_STATE,
+            this(data,
                 ApiKeys.READ_SHARE_GROUP_STATE.oldestVersion(),
                 ApiKeys.READ_SHARE_GROUP_STATE.latestVersionForRequestHeader(requestHeaderVersion));
+        }
+
+        public static Builder forTransactionalState(ReadShareGroupStateRequestData data) {
+            return new Builder(data, (short) 2, (short) 2);
+        }
+
+        private Builder(ReadShareGroupStateRequestData data, short oldestVersion, short latestVersion) {
+            super(ApiKeys.READ_SHARE_GROUP_STATE, oldestVersion, latestVersion);
             this.data = data;
         }
 

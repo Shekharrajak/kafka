@@ -92,6 +92,7 @@ import org.apache.kafka.common.utils.internals.LogContext;
 import org.apache.kafka.coordinator.common.runtime.CoordinatorRecord;
 import org.apache.kafka.coordinator.common.runtime.CoordinatorRuntime;
 import org.apache.kafka.coordinator.common.runtime.MetadataImageBuilder;
+import org.apache.kafka.coordinator.common.runtime.PartitionWriter.TransactionVerificationMode;
 import org.apache.kafka.coordinator.group.api.streams.StreamsGroupTopologyDescriptionPlugin;
 import org.apache.kafka.coordinator.group.metrics.GroupCoordinatorMetrics;
 import org.apache.kafka.coordinator.group.streams.StreamsGroupDescribeResult;
@@ -3057,7 +3058,7 @@ public class GroupCoordinatorServiceTest {
             ArgumentMatchers.eq(10L),
             ArgumentMatchers.eq((short) 5),
             ArgumentMatchers.any(),
-            ArgumentMatchers.eq((int) txnOffsetCommitVersion)
+            ArgumentMatchers.eq(TransactionVerificationMode.forTxnOffsetCommitVersion(txnOffsetCommitVersion))
         )).thenReturn(CompletableFuture.completedFuture(response));
 
         CompletableFuture<TxnOffsetCommitResponseData> future = service.commitTransactionalOffsets(
@@ -3111,7 +3112,7 @@ public class GroupCoordinatorServiceTest {
             ArgumentMatchers.eq(10L),
             ArgumentMatchers.eq((short) 5),
             ArgumentMatchers.any(),
-            ArgumentMatchers.eq((int) ApiKeys.TXN_OFFSET_COMMIT.latestVersion())
+            ArgumentMatchers.eq(TransactionVerificationMode.ADD_PARTITION)
         )).thenReturn(CompletableFuture.failedFuture(new CompletionException(error.exception())));
 
         CompletableFuture<TxnOffsetCommitResponseData> future = service.commitTransactionalOffsets(
