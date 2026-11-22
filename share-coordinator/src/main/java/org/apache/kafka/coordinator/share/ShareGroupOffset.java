@@ -17,6 +17,7 @@
 
 package org.apache.kafka.coordinator.share;
 
+import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.message.InitializeShareGroupStateRequestData;
 import org.apache.kafka.common.message.WriteShareGroupStateRequestData;
 import org.apache.kafka.coordinator.share.generated.ShareSnapshotValue;
@@ -46,6 +47,8 @@ public class ShareGroupOffset {
     private final List<PersisterStateBatch> stateBatches;
     private final long createTimestamp;
     private final long writeTimestamp;
+    private final Uuid stateIncarnationId;
+    private final Uuid writerGeneration;
 
     private ShareGroupOffset(
         int snapshotEpoch,
@@ -55,7 +58,9 @@ public class ShareGroupOffset {
         int deliveryCompleteCount,
         List<PersisterStateBatch> stateBatches,
         long createTimestamp,
-        long writeTimestamp
+        long writeTimestamp,
+        Uuid stateIncarnationId,
+        Uuid writerGeneration
     ) {
         this.snapshotEpoch = snapshotEpoch;
         this.stateEpoch = stateEpoch;
@@ -65,6 +70,16 @@ public class ShareGroupOffset {
         this.stateBatches = stateBatches;
         this.createTimestamp = createTimestamp;
         this.writeTimestamp = writeTimestamp;
+        this.stateIncarnationId = stateIncarnationId;
+        this.writerGeneration = writerGeneration;
+    }
+
+    public Uuid stateIncarnationId() {
+        return stateIncarnationId;
+    }
+
+    public Uuid writerGeneration() {
+        return writerGeneration;
     }
 
     public int snapshotEpoch() {
@@ -118,7 +133,9 @@ public class ShareGroupOffset {
                 .map(ShareGroupOffset::toPersisterOffsetsStateBatch)
                 .toList(),
             record.createTimestamp(),
-            record.writeTimestamp()
+            record.writeTimestamp(),
+            record.stateIncarnationId(),
+            record.writerGeneration()
         );
     }
 
@@ -133,7 +150,9 @@ public class ShareGroupOffset {
                 .map(ShareGroupOffset::toPersisterOffsetsStateBatch)
                 .toList(),
             NO_TIMESTAMP,
-            NO_TIMESTAMP
+            NO_TIMESTAMP,
+            record.stateIncarnationId(),
+            Uuid.ZERO_UUID
         );
     }
 
@@ -152,7 +171,9 @@ public class ShareGroupOffset {
                 .map(PersisterStateBatch::from)
                 .toList(),
             timestamp,
-            timestamp
+            timestamp,
+            data.stateIncarnationId(),
+            data.writerGeneration()
         );
     }
 
@@ -175,7 +196,9 @@ public class ShareGroupOffset {
             deliveryCompleteCount,
             List.of(),
             timestamp,
-            timestamp
+            timestamp,
+            Uuid.ZERO_UUID,
+            Uuid.ZERO_UUID
         );
     }
 
@@ -188,6 +211,8 @@ public class ShareGroupOffset {
         private List<PersisterStateBatch> stateBatches;
         private long createTimestamp = NO_TIMESTAMP;
         private long writeTimestamp = NO_TIMESTAMP;
+        private Uuid stateIncarnationId = Uuid.ZERO_UUID;
+        private Uuid writerGeneration = Uuid.ZERO_UUID;
 
         public Builder setSnapshotEpoch(int snapshotEpoch) {
             this.snapshotEpoch = snapshotEpoch;
@@ -229,8 +254,18 @@ public class ShareGroupOffset {
             return this;
         }
 
+        public Builder setStateIncarnationId(Uuid stateIncarnationId) {
+            this.stateIncarnationId = stateIncarnationId;
+            return this;
+        }
+
+        public Builder setWriterGeneration(Uuid writerGeneration) {
+            this.writerGeneration = writerGeneration;
+            return this;
+        }
+
         public ShareGroupOffset build() {
-            return new ShareGroupOffset(snapshotEpoch, stateEpoch, leaderEpoch, startOffset, deliveryCompleteCount, stateBatches, createTimestamp, writeTimestamp);
+            return new ShareGroupOffset(snapshotEpoch, stateEpoch, leaderEpoch, startOffset, deliveryCompleteCount, stateBatches, createTimestamp, writeTimestamp, stateIncarnationId, writerGeneration);
         }
     }
 
@@ -246,12 +281,13 @@ public class ShareGroupOffset {
             deliveryCompleteCount == that.deliveryCompleteCount &&
             Objects.equals(stateBatches, that.stateBatches) &&
             createTimestamp == that.createTimestamp &&
-            writeTimestamp == that.writeTimestamp;
+            writeTimestamp == that.writeTimestamp &&
+            stateIncarnationId.equals(that.stateIncarnationId) && writerGeneration.equals(that.writerGeneration);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(snapshotEpoch, stateEpoch, leaderEpoch, startOffset, deliveryCompleteCount, stateBatches, createTimestamp, writeTimestamp);
+        return Objects.hash(snapshotEpoch, stateEpoch, leaderEpoch, startOffset, deliveryCompleteCount, stateBatches, createTimestamp, writeTimestamp, stateIncarnationId, writerGeneration);
     }
 
     @Override
@@ -270,6 +306,8 @@ public class ShareGroupOffset {
 
     public Builder builderSupplier() {
         return new Builder()
+            .setStateIncarnationId(stateIncarnationId())
+            .setWriterGeneration(writerGeneration())
             .setSnapshotEpoch(snapshotEpoch())
             .setStateEpoch(stateEpoch())
             .setLeaderEpoch(leaderEpoch())

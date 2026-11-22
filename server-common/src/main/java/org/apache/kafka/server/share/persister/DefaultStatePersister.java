@@ -19,13 +19,19 @@ package org.apache.kafka.server.share.persister;
 
 import org.apache.kafka.clients.KafkaClient;
 import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.message.ReadShareGroupStateRequestData;
+import org.apache.kafka.common.message.ReadShareGroupStateResponseData;
+import org.apache.kafka.common.message.WriteShareGroupStateRequestData;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.requests.DeleteShareGroupStateResponse;
 import org.apache.kafka.common.requests.InitializeShareGroupStateResponse;
+import org.apache.kafka.common.requests.ReadShareGroupStateRequest;
 import org.apache.kafka.common.requests.ReadShareGroupStateResponse;
 import org.apache.kafka.common.requests.ReadShareGroupStateSummaryResponse;
+import org.apache.kafka.common.requests.WriteShareGroupStateRequest;
 import org.apache.kafka.common.requests.WriteShareGroupStateResponse;
 import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.server.share.SharePartitionKey;
 import org.apache.kafka.server.util.timer.Timer;
 
 import org.slf4j.Logger;
@@ -64,6 +70,83 @@ public class DefaultStatePersister implements Persister {
 
     private void start() {
         this.stateManager.start();
+    }
+
+    @Override
+    public CompletableFuture<ReadShareGroupStateResponseData.PartitionResult> readFencedState(
+        SharePartitionKey key,
+        int leaderEpoch,
+        Uuid expectedWriterGeneration,
+        Uuid newWriterGeneration
+    ) {
+        var partition = new ReadShareGroupStateRequestData.PartitionData()
+            .setPartition(key.partition())
+            .setLeaderEpoch(leaderEpoch)
+            .setExpectedWriterGeneration(expectedWriterGeneration)
+            .setNewWriterGeneration(newWriterGeneration);
+        var request = new ReadShareGroupStateRequestData().setGroupId(key.groupId())
+            .setTopics(List.of(new ReadShareGroupStateRequestData.ReadStateData()
+                .setTopicId(key.topicId()).setPartitions(List.of(partition))));
+        var result = new CompletableFuture<ReadShareGroupStateResponse>();
+        stateManager.enqueue(stateManager.new ReadStateHandler(key.groupId(), key.topicId(), key.partition(), leaderEpoch, result) {
+            @Override
+            protected ReadShareGroupStateRequest.Builder requestBuilder() {
+                return ReadShareGroupStateRequest.Builder.forTransactionalState(request);
+            }
+
+            @Override
+            protected boolean isBatchable() {
+                return false;
+            }
+        });
+        return result.thenApply(response -> {
+            var state = response.data().results().get(0).partitions().get(0);
+            throwIfStateError(state.errorCode(), state.errorMessage());
+            return state;
+        });
+    }
+
+    @Override
+    public CompletableFuture<Void> writeFencedState(
+        SharePartitionKey key,
+        WriteShareGroupStateRequestData.PartitionData partition,
+        String transactionalId,
+        long producerId,
+        short producerEpoch
+    ) {
+        var request = new WriteShareGroupStateRequestData().setGroupId(key.groupId())
+            .setTransactionalId(transactionalId).setProducerId(producerId).setProducerEpoch(producerEpoch)
+            .setTopics(List.of(new WriteShareGroupStateRequestData.WriteStateData()
+                .setTopicId(key.topicId()).setPartitions(List.of(partition.duplicate().setPartition(key.partition())))));
+        var result = new CompletableFuture<WriteShareGroupStateResponse>();
+        stateManager.enqueue(stateManager.new WriteStateHandler(key.groupId(), key.topicId(), key.partition(),
+            partition.stateEpoch(), partition.leaderEpoch(), partition.startOffset(), partition.deliveryCompleteCount(), List.of(), result) {
+            @Override
+            protected WriteShareGroupStateRequest.Builder requestBuilder() {
+                return WriteShareGroupStateRequest.Builder.forTransactionalState(request);
+            }
+
+            @Override
+            protected boolean isRetryableWriteError(Errors error) {
+                return super.isRetryableWriteError(error) || (transactionalId != null && error == Errors.CONCURRENT_TRANSACTIONS);
+            }
+
+            @Override
+            protected boolean isBatchable() {
+                return false;
+            }
+        });
+        return result.thenAccept(response -> {
+            var state = response.data().results().get(0).partitions().get(0);
+            throwIfStateError(state.errorCode(), state.errorMessage());
+        });
+    }
+
+    private static void throwIfStateError(short errorCode, String errorMessage) {
+        Errors error = Errors.forCode(errorCode);
+        if (error != Errors.NONE) {
+            throw error.exception(errorMessage);
+        }
     }
 
     @Override

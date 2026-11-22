@@ -134,9 +134,16 @@ class CoordinatorPartitionWriter(
     transactionalId: String,
     producerId: Long,
     producerEpoch: Short,
-    apiVersion: Int
+    mode: PartitionWriter.TransactionVerificationMode
   ): CompletableFuture[VerificationGuard] = {
-    val transactionSupportedOperation = AddPartitionsToTxnManager.txnOffsetCommitRequestVersionToTransactionSupportedOperation(apiVersion)
+    val transactionSupportedOperation = mode match {
+      case PartitionWriter.TransactionVerificationMode.VERIFY_ONLY =>
+        AddPartitionsToTxnManager.TransactionSupportedOperation.DEFAULT_ERROR
+      case PartitionWriter.TransactionVerificationMode.VERIFY_WITH_ABORTABLE_ERROR =>
+        AddPartitionsToTxnManager.TransactionSupportedOperation.GENERIC_ERROR_SUPPORTED
+      case PartitionWriter.TransactionVerificationMode.ADD_PARTITION =>
+        AddPartitionsToTxnManager.TransactionSupportedOperation.ADD_PARTITION
+    }
     val future = new CompletableFuture[VerificationGuard]()
     replicaManager.maybeSendPartitionToTransactionCoordinator(
       topicPartition = tp,

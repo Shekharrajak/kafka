@@ -17,6 +17,7 @@
 
 package org.apache.kafka.coordinator.share;
 
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.message.DeleteShareGroupStateRequestData;
 import org.apache.kafka.common.message.DeleteShareGroupStateResponseData;
 import org.apache.kafka.common.message.InitializeShareGroupStateRequestData;
@@ -28,6 +29,7 @@ import org.apache.kafka.common.message.ReadShareGroupStateSummaryResponseData;
 import org.apache.kafka.common.message.WriteShareGroupStateRequestData;
 import org.apache.kafka.common.message.WriteShareGroupStateResponseData;
 import org.apache.kafka.common.requests.RequestContext;
+import org.apache.kafka.common.requests.TransactionResult;
 import org.apache.kafka.image.MetadataDelta;
 import org.apache.kafka.image.MetadataImage;
 import org.apache.kafka.server.share.SharePartitionKey;
@@ -73,6 +75,15 @@ public interface ShareCoordinator {
      */
     CompletableFuture<WriteShareGroupStateResponseData> writeState(RequestContext context, WriteShareGroupStateRequestData request);
 
+
+    CompletableFuture<Void> completeTransaction(
+        TopicPartition tp,
+        long producerId,
+        short markerEpoch,
+        int coordinatorEpoch,
+        TransactionResult result,
+        short transactionVersion
+    );
 
     /**
      * Handle read share state call

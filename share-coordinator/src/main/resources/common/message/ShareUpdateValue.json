@@ -29,6 +29,10 @@
     // DeliveryCompleteCount was added in Apache Kafka 4.2 (KIP-1226).
     { "name": "DeliveryCompleteCount", "type": "int32", "versions": "0+", "taggedVersions": "0+", "tag": 0, "default": "-1",
       "about": "The number of offsets greater than or equal to share-partition start offset for which delivery has been completed." },
+    { "name": "TransactionalId", "type": "string", "versions": "0+", "taggedVersions": "0+", "tag": 1, "nullableVersions": "0+", "default": "null",
+      "about": "The transactional ID for a staged update, or null for an ordinary update." },
+    { "name": "StateIncarnationId", "type": "uuid", "versions": "0+", "taggedVersions": "0+", "tag": 2,
+      "about": "The logical share state that owns a staged update." },
     { "name": "StateBatches", "type": "[]StateBatch", "versions": "0+",
       "about": "The state batches that have been updated.", "fields": [
       { "name": "FirstOffset", "type": "int64", "versions": "0+",

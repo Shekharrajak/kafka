@@ -21,12 +21,13 @@ import org.apache.kafka.common.{TopicIdPartition, TopicPartition, Uuid}
 import org.apache.kafka.common.compress.Compression
 import org.apache.kafka.common.errors.NotLeaderOrFollowerException
 import org.apache.kafka.common.message.DeleteRecordsResponseData.DeleteRecordsPartitionResult
-import org.apache.kafka.common.protocol.{ApiKeys, Errors}
+import org.apache.kafka.common.protocol.Errors
 import org.apache.kafka.common.record.internal.{CompressionType, ControlRecordType, EndTransactionMarker, MemoryRecords, RecordBatch, SimpleRecord}
 import org.apache.kafka.coordinator.common.runtime.PartitionWriter
 import org.apache.kafka.server.LogAppendResult
 import org.apache.kafka.server.LogAppendResult.LogAppendSummary
 import org.apache.kafka.server.common.TransactionVersion
+import org.apache.kafka.server.transaction.AddPartitionsToTxnManager.TransactionSupportedOperation
 import org.apache.kafka.storage.internals.log.{AppendOrigin, LogAppendInfo, LogConfig, RecordValidationStats, VerificationGuard}
 import org.apache.kafka.test.TestUtils.assertFutureThrows
 import org.junit.jupiter.api.Assertions.{assertEquals, assertNull, assertThrows, assertTrue}
@@ -313,6 +314,26 @@ class CoordinatorPartitionWriterTest {
   @ParameterizedTest
   @EnumSource(value = classOf[Errors], names = Array("NONE", "NOT_ENOUGH_REPLICAS"))
   def testMaybeStartTransactionVerification(error: Errors): Unit = {
+    assertTransactionVerification(error, PartitionWriter.TransactionVerificationMode.ADD_PARTITION,
+      TransactionSupportedOperation.ADD_PARTITION)
+  }
+
+  @ParameterizedTest
+  @EnumSource(classOf[PartitionWriter.TransactionVerificationMode])
+  def testTransactionVerificationMode(mode: PartitionWriter.TransactionVerificationMode): Unit = {
+    val expectedOperation = mode match {
+      case PartitionWriter.TransactionVerificationMode.VERIFY_ONLY => TransactionSupportedOperation.DEFAULT_ERROR
+      case PartitionWriter.TransactionVerificationMode.VERIFY_WITH_ABORTABLE_ERROR => TransactionSupportedOperation.GENERIC_ERROR_SUPPORTED
+      case PartitionWriter.TransactionVerificationMode.ADD_PARTITION => TransactionSupportedOperation.ADD_PARTITION
+    }
+    assertTransactionVerification(Errors.NONE, mode, expectedOperation)
+  }
+
+  private def assertTransactionVerification(
+    error: Errors,
+    mode: PartitionWriter.TransactionVerificationMode,
+    expectedOperation: TransactionSupportedOperation
+  ): Unit = {
     val tp = new TopicPartition("foo", 0)
     val replicaManager = mock(classOf[ReplicaManager])
     val partitionRecordWriter = new CoordinatorPartitionWriter(
@@ -335,7 +356,7 @@ class CoordinatorPartitionWriterTest {
       ArgumentMatchers.eq(5.toShort),
       ArgumentMatchers.eq(RecordBatch.NO_SEQUENCE),
       callbackCapture.capture(),
-      ArgumentMatchers.any()
+      ArgumentMatchers.eq(expectedOperation)
     )).thenAnswer(_ => {
       callbackCapture.getValue.apply((
         error,
@@ -348,7 +369,7 @@ class CoordinatorPartitionWriterTest {
       "transactional-id",
       10L,
       5.toShort,
-      ApiKeys.TXN_OFFSET_COMMIT.latestVersion().toInt
+      mode
     )
 
     if (error == Errors.NONE) {

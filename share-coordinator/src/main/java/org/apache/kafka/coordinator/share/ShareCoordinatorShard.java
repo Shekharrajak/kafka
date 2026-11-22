@@ -32,6 +32,7 @@ import org.apache.kafka.common.message.WriteShareGroupStateRequestData;
 import org.apache.kafka.common.message.WriteShareGroupStateResponseData;
 import org.apache.kafka.common.protocol.ApiMessage;
 import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.record.internal.RecordBatch;
 import org.apache.kafka.common.requests.DeleteShareGroupStateResponse;
 import org.apache.kafka.common.requests.InitializeShareGroupStateResponse;
 import org.apache.kafka.common.requests.ReadShareGroupStateResponse;
@@ -70,6 +71,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
 
 public class ShareCoordinatorShard implements CoordinatorShard<CoordinatorRecord> {
@@ -86,6 +88,7 @@ public class ShareCoordinatorShard implements CoordinatorShard<CoordinatorRecord
     private CoordinatorMetadataImage metadataImage;
     private final ShareCoordinatorOffsetsManager offsetsManager;
     private final Time time;
+    private final ShareTransactionState transactions;
 
     public static final Exception NULL_TOPIC_ID = new Exception("The topic id cannot be null.");
     public static final Exception NEGATIVE_PARTITION_ID = new Exception("The partition id cannot be a negative number.");
@@ -206,6 +209,7 @@ public class ShareCoordinatorShard implements CoordinatorShard<CoordinatorRecord
         this.stateEpochMap = new TimelineHashMap<>(snapshotRegistry, 0);
         this.offsetsManager = offsetsManager;
         this.time = time;
+        this.transactions = new ShareTransactionState(snapshotRegistry);
     }
 
     @Override
@@ -235,7 +239,18 @@ public class ShareCoordinatorShard implements CoordinatorShard<CoordinatorRecord
                     handleShareSnapshot((ShareSnapshotKey) key, (ShareSnapshotValue) messageOrNull(value), offset);
                     break;
                 case SHARE_UPDATE:
-                    handleShareUpdate((ShareUpdateKey) key, (ShareUpdateValue) messageOrNull(value));
+                    ShareUpdateValue update = (ShareUpdateValue) messageOrNull(value);
+                    if (update.transactionalId() != null) {
+                        if (producerId == RecordBatch.NO_PRODUCER_ID) {
+                            throw new IllegalStateException("Transactional share update has no producer identity");
+                        }
+                        ShareUpdateKey updateKey = (ShareUpdateKey) key;
+                        transactions.replay(offset, new ShareTransactionState.Key(
+                            new ShareTransactionState.Owner(producerId, producerEpoch),
+                            SharePartitionKey.getInstance(updateKey.groupId(), updateKey.topicId(), updateKey.partition())), update);
+                    } else {
+                        handleShareUpdate((ShareUpdateKey) key, update);
+                    }
                     break;
                 default:
                     // Noop
@@ -250,6 +265,7 @@ public class ShareCoordinatorShard implements CoordinatorShard<CoordinatorRecord
         if (value == null) {
             log.debug("Tombstone records received for share partition key: {}", mapKey);
             // Consider this a tombstone.
+            transactions.delete(mapKey);
             shareStateMap.remove(mapKey);
             leaderEpochMap.remove(mapKey);
             stateEpochMap.remove(mapKey);
@@ -258,6 +274,7 @@ public class ShareCoordinatorShard implements CoordinatorShard<CoordinatorRecord
             maybeUpdateLeaderEpochMap(mapKey, value.leaderEpoch());
             maybeUpdateStateEpochMap(mapKey, value.stateEpoch());
 
+            transactions.snapshot(mapKey);
             ShareGroupOffset offsetRecord = ShareGroupOffset.fromRecord(value);
             // This record is the complete snapshot.
             shareStateMap.put(mapKey, offsetRecord);
@@ -301,7 +318,21 @@ public class ShareCoordinatorShard implements CoordinatorShard<CoordinatorRecord
 
     @Override
     public void replayEndTransactionMarker(long producerId, short producerEpoch, TransactionResult result) throws RuntimeException {
-        CoordinatorShard.super.replayEndTransactionMarker(producerId, producerEpoch, result);
+        if (producerEpoch <= 0) return;
+        ShareTransactionState.Owner owner = new ShareTransactionState.Owner(producerId, (short) (producerEpoch - 1));
+        transactions.complete(owner).forEach((key, intent) -> {
+            ShareGroupOffset current = shareStateMap.get(key);
+            if (current == null || !current.stateIncarnationId().equals(intent.incarnationId())) return;
+            List<PersisterStateBatch> batches = current.stateBatches();
+            for (PersisterStateBatch batch : intent.batches()) {
+                batches = replaceRange(batches, new PersisterStateBatch(batch.firstOffset(), batch.lastOffset(),
+                    result == TransactionResult.COMMIT ? batch.deliveryState() : (byte) 0, batch.deliveryCount()));
+            }
+            long terminalCount = batches.stream().filter(batch -> batch.deliveryState() == 2 || batch.deliveryState() == 4)
+                .mapToLong(batch -> Math.max(0, batch.lastOffset() - Math.max(batch.firstOffset(), current.startOffset()) + 1)).sum();
+            shareStateMap.put(key, current.builderSupplier().setStateBatches(batches)
+                .setDeliveryCompleteCount(Math.toIntExact(terminalCount)).setWriteTimestamp(time.milliseconds()).build());
+        });
     }
 
     /**
@@ -334,7 +365,36 @@ public class ShareCoordinatorShard implements CoordinatorShard<CoordinatorRecord
         WriteShareGroupStateRequestData.PartitionData partitionData = topicData.partitions().get(0);
         SharePartitionKey key = SharePartitionKey.getInstance(request.groupId(), topicData.topicId(), partitionData.partition());
 
-        CoordinatorRecord record = generateShareStateRecord(partitionData, key, false);
+        ShareGroupOffset current = shareStateMap.get(key);
+        if (!current.stateIncarnationId().equals(partitionData.stateIncarnationId()) ||
+                !current.writerGeneration().equals(partitionData.writerGeneration())) {
+            return getWriteErrorCoordinatorResult(Errors.FENCED_STATE_EPOCH, null, key.topicId(), key.partition());
+        }
+        List<PersisterStateBatch> batches = partitionData.stateBatches().stream().map(PersisterStateBatch::from).toList();
+        boolean transactional = request.transactionalId() != null;
+        ShareTransactionState.Owner owner = transactional ?
+            new ShareTransactionState.Owner(request.producerId(), request.producerEpoch()) : null;
+        Errors conflict = transactions.validate(key, owner, request.transactionalId(), batches, partitionData.startOffset());
+        if (conflict != Errors.NONE) return getWriteErrorCoordinatorResult(conflict, null, key.topicId(), key.partition());
+        if (transactional && invalidTransactionalWrite(request, partitionData, current, batches)) {
+            return getWriteErrorCoordinatorResult(Errors.INVALID_REQUEST, null, key.topicId(), key.partition());
+        }
+        if (transactional && batches.stream().anyMatch(batch -> current.stateBatches().stream().anyMatch(existing ->
+                ShareTransactionState.overlaps(existing, batch) && (existing.deliveryState() >= 2 ||
+                    existing.deliveryCount() > batch.deliveryCount())))) {
+            return getWriteErrorCoordinatorResult(Errors.INVALID_RECORD_STATE, null, key.topicId(), key.partition());
+        }
+        CoordinatorRecord record;
+        if (transactional) {
+            if (transactions.isDuplicate(new ShareTransactionState.Key(owner, key), batches)) {
+                return new CoordinatorResult<>(List.of(), successfulWrite(key));
+            }
+            record = ShareCoordinatorRecordHelpers.newShareUpdateRecord(key.groupId(), key.topicId(), key.partition(),
+                current.builderSupplier().setStartOffset(-1).setDeliveryCompleteCount(-1).setStateBatches(batches).build());
+            ((ShareUpdateValue) record.value().message()).setTransactionalId(request.transactionalId());
+        } else {
+            record = generateShareStateRecord(partitionData, key, false);
+        }
         // build successful response if record is correctly created
         WriteShareGroupStateResponseData responseData = new WriteShareGroupStateResponseData().setResults(
             List.of(WriteShareGroupStateResponse.toResponseWriteStateResult(key.topicId(),
@@ -373,6 +433,24 @@ public class ShareCoordinatorShard implements CoordinatorShard<CoordinatorRecord
         SharePartitionKey key = SharePartitionKey.getInstance(request.groupId(), topicId, partitionId);
 
         ShareGroupOffset offsetValue = shareStateMap.get(key);
+        Uuid newGeneration = partitionData.newWriterGeneration();
+        CoordinatorRecord identityRecord = null;
+        if (Uuid.ZERO_UUID.equals(newGeneration) && !Uuid.ZERO_UUID.equals(partitionData.expectedWriterGeneration()) &&
+                !partitionData.expectedWriterGeneration().equals(offsetValue.writerGeneration())) {
+            return new CoordinatorResult<>(List.of(), ReadShareGroupStateResponse.toErrorResponseData(
+                topicId, partitionId, Errors.FENCED_STATE_EPOCH, "Writer generation changed"));
+        }
+        if (!Uuid.ZERO_UUID.equals(newGeneration) && !newGeneration.equals(offsetValue.writerGeneration())) {
+            if (!partitionData.expectedWriterGeneration().equals(offsetValue.writerGeneration())) {
+                return new CoordinatorResult<>(List.of(), ReadShareGroupStateResponse.toErrorResponseData(
+                    topicId, partitionId, Errors.FENCED_STATE_EPOCH, "Writer generation changed"));
+            }
+            offsetValue = offsetValue.builderSupplier().setSnapshotEpoch(offsetValue.snapshotEpoch() + 1)
+                .setLeaderEpoch(leaderEpoch).setWriterGeneration(newGeneration)
+                .setStateIncarnationId(Uuid.ZERO_UUID.equals(offsetValue.stateIncarnationId()) ?
+                    Uuid.randomUuid() : offsetValue.stateIncarnationId()).build();
+            identityRecord = ShareCoordinatorRecordHelpers.newShareSnapshotRecord(request.groupId(), topicId, partitionId, offsetValue);
+        }
         List<ReadShareGroupStateResponseData.StateBatch> stateBatches = (offsetValue.stateBatches() != null && !offsetValue.stateBatches().isEmpty()) ?
             offsetValue.stateBatches().stream()
                 .map(
@@ -390,6 +468,11 @@ public class ShareCoordinatorShard implements CoordinatorShard<CoordinatorRecord
             offsetValue.stateEpoch(),
             stateBatches
         );
+
+        responseData.results().get(0).partitions().get(0)
+            .setStateIncarnationId(offsetValue.stateIncarnationId()).setWriterGeneration(offsetValue.writerGeneration())
+            .setPendingTransactions(transactions.read(key));
+        if (identityRecord != null) return new CoordinatorResult<>(List.of(identityRecord), responseData);
 
         // Optimization in case leaderEpoch update is not required.
         if (leaderEpochMap.get(key) != null && leaderEpochMap.get(key) == leaderEpoch) {
@@ -486,10 +569,10 @@ public class ShareCoordinatorShard implements CoordinatorShard<CoordinatorRecord
      * @return CoordinatorResult containing empty record list and an Optional<Long> representing the offset.
      */
     public CoordinatorResult<Optional<Long>, CoordinatorRecord> lastRedundantOffset() {
-        return new CoordinatorResult<>(
-            List.of(),
-            this.offsetsManager.lastRedundantOffset()
-        );
+        Optional<Long> redundant = offsetsManager.lastRedundantOffset();
+        OptionalLong required = transactions.firstRequiredOffset();
+        if (required.isPresent()) redundant = Optional.of(Math.min(redundant.orElse(Long.MAX_VALUE), required.getAsLong()));
+        return new CoordinatorResult<>(List.of(), redundant);
     }
 
     /**
@@ -517,6 +600,16 @@ public class ShareCoordinatorShard implements CoordinatorShard<CoordinatorRecord
         DeleteShareGroupStateRequestData.PartitionData partitionData = topicData.partitions().get(0);
         SharePartitionKey key = SharePartitionKey.getInstance(request.groupId(), topicData.topicId(), partitionData.partition());
 
+        if (transactions.hasPending(key)) {
+            return new CoordinatorResult<>(List.of(), DeleteShareGroupStateResponse.toErrorResponseData(
+                key.topicId(), key.partition(), Errors.CONCURRENT_TRANSACTIONS, "Share transactions are pending"));
+        }
+
+        ShareGroupOffset existing = shareStateMap.get(key);
+        if (existing != null && !Uuid.ZERO_UUID.equals(existing.stateIncarnationId())) {
+            return getDeleteErrorCoordinatorResult(Errors.INVALID_REQUEST,
+                new IllegalArgumentException("Transactional share state requires generation-fenced deletion"), key.topicId(), key.partition());
+        }
         if (!shareStateMap.containsKey(key)) {
             log.warn("Attempted to delete non-existent share partition {}.", key);
             return new CoordinatorResult<>(List.of(), new DeleteShareGroupStateResponseData().setResults(
@@ -564,6 +657,11 @@ public class ShareCoordinatorShard implements CoordinatorShard<CoordinatorRecord
 
         SharePartitionKey key = SharePartitionKey.getInstance(groupId, topicId, partitionData.partition());
 
+        if (transactions.hasPending(key)) {
+            return new CoordinatorResult<>(List.of(), InitializeShareGroupStateResponse.toErrorResponseData(
+                key.topicId(), key.partition(), Errors.CONCURRENT_TRANSACTIONS, "Share transactions are pending"));
+        }
+
         Integer currentStateEpoch = stateEpochMap.get(key);
         ShareGroupOffset currentState = shareStateMap.get(key);
 
@@ -580,7 +678,14 @@ public class ShareCoordinatorShard implements CoordinatorShard<CoordinatorRecord
             return new CoordinatorResult<>(List.of(), responseData);
         }
 
+        if (currentState != null && !Uuid.ZERO_UUID.equals(currentState.stateIncarnationId()) &&
+                currentStateEpoch != null && partitionData.stateEpoch() <= currentStateEpoch) {
+            return getInitializeErrorCoordinatorResult(Errors.FENCED_STATE_EPOCH, null, topicId, partitionData.partition());
+        }
         CoordinatorRecord record = generateInitializeStateRecord(partitionData, key);
+        if (currentState != null && !Uuid.ZERO_UUID.equals(currentState.stateIncarnationId())) {
+            ((ShareSnapshotValue) record.value().message()).setStateIncarnationId(Uuid.randomUuid());
+        }
         return new CoordinatorResult<>(List.of(record), responseData);
     }
 
@@ -597,7 +702,7 @@ public class ShareCoordinatorShard implements CoordinatorShard<CoordinatorRecord
 
         // If all share partitions are snapshotted, it means that
         // system is quiet and cold snapshotting will not help much.
-        if (coldSnapshottedPartitionsCount == shareStateMap.size()) {
+        if (coldSnapshottedPartitionsCount == shareStateMap.size() && transactions.unresolvedSnapshots().isEmpty()) {
             log.debug("All share snapshot records already cold snapshotted, skipping.");
             return new CoordinatorResult<>(List.of(), null);
         }
@@ -607,7 +712,8 @@ public class ShareCoordinatorShard implements CoordinatorShard<CoordinatorRecord
 
         shareStateMap.forEach((sharePartitionKey, shareGroupOffset) -> {
             long timeSinceLastSnapshot = time.milliseconds() - shareGroupOffset.writeTimestamp();
-            if (timeSinceLastSnapshot >= config.shareCoordinatorColdPartitionSnapshotIntervalMs()) {
+            if (timeSinceLastSnapshot >= config.shareCoordinatorColdPartitionSnapshotIntervalMs() ||
+                    transactions.unresolvedSnapshots().contains(sharePartitionKey)) {
                 // We need to force create a snapshot here
                 log.debug("Last snapshot for {} is older than allowed interval (last snapshot delta {}).", sharePartitionKey, timeSinceLastSnapshot);
                 records.add(ShareCoordinatorRecordHelpers.newShareSnapshotRecord(
@@ -688,7 +794,7 @@ public class ShareCoordinatorShard implements CoordinatorShard<CoordinatorRecord
             // The incoming partition data could have overlapping state batches, we must merge them.
             return ShareCoordinatorRecordHelpers.newShareSnapshotRecord(
                 key.groupId(), key.topicId(), partitionData.partition(),
-                new ShareGroupOffset.Builder()
+                currentState.builderSupplier()
                     .setSnapshotEpoch(currentState.snapshotEpoch() + 1)   // We must increment snapshot epoch as this is new snapshot.
                     .setStartOffset(newStartOffset)
                     .setDeliveryCompleteCount(deliveryCompleteCount)
@@ -704,7 +810,7 @@ public class ShareCoordinatorShard implements CoordinatorShard<CoordinatorRecord
             // The incoming partition data could have overlapping state batches, we must merge them.
             return ShareCoordinatorRecordHelpers.newShareUpdateRecord(
                 key.groupId(), key.topicId(), partitionData.partition(),
-                new ShareGroupOffset.Builder()
+                currentState.builderSupplier()
                     .setSnapshotEpoch(currentState.snapshotEpoch()) // Use same snapshotEpoch as last share snapshot.
                     .setStartOffset(newStartOffset) // Prevents start offset from regressing.
                     .setDeliveryCompleteCount(deliveryCompleteCount)
@@ -1048,7 +1154,7 @@ public class ShareCoordinatorShard implements CoordinatorShard<CoordinatorRecord
         long newStartOffset = newData.startOffset() == -1 ? soFar.startOffset() : newData.startOffset();
         int newLeaderEpoch = newData.leaderEpoch() == -1 ? soFar.leaderEpoch() : newData.leaderEpoch();
 
-        return new ShareGroupOffset.Builder()
+        return soFar.builderSupplier()
             .setSnapshotEpoch(soFar.snapshotEpoch())
             .setStateEpoch(soFar.stateEpoch())
             .setStartOffset(newStartOffset)
@@ -1061,6 +1167,54 @@ public class ShareCoordinatorShard implements CoordinatorShard<CoordinatorRecord
             .setCreateTimestamp(soFar.createTimestamp())
             .setWriteTimestamp(soFar.writeTimestamp())
             .build();
+    }
+
+    public record TransactionCompletion(String transactionalId, long producerId, short producerEpoch,
+                                        Set<SharePartitionKey> sharePartitions) { }
+
+    public Optional<TransactionCompletion> transactionCompletion(long producerId, short stagedEpoch) {
+        return transactions.completion(new ShareTransactionState.Owner(producerId, stagedEpoch));
+    }
+
+    private static boolean invalidTransactionalWrite(
+        WriteShareGroupStateRequestData request,
+        WriteShareGroupStateRequestData.PartitionData partition,
+        ShareGroupOffset current,
+        List<PersisterStateBatch> batches
+    ) {
+        if (request.transactionalId().isEmpty() || request.producerId() < 0 || request.producerEpoch() < 0 ||
+                request.producerEpoch() == Short.MAX_VALUE) return true;
+        if (Uuid.ZERO_UUID.equals(current.stateIncarnationId()) || Uuid.ZERO_UUID.equals(current.writerGeneration()) ||
+                batches.isEmpty()) return true;
+        if (partition.startOffset() != -1 || partition.deliveryCompleteCount() != -1) return true;
+        return batches.stream().anyMatch(batch -> batch.deliveryState() < 2 || batch.deliveryState() > 4 ||
+            batch.firstOffset() < current.startOffset());
+    }
+
+    private static WriteShareGroupStateResponseData successfulWrite(SharePartitionKey key) {
+        return new WriteShareGroupStateResponseData().setResults(List.of(
+            WriteShareGroupStateResponse.toResponseWriteStateResult(key.topicId(),
+                List.of(WriteShareGroupStateResponse.toResponsePartitionResult(key.partition())))));
+    }
+
+    private static List<PersisterStateBatch> replaceRange(List<PersisterStateBatch> current, PersisterStateBatch replacement) {
+        List<PersisterStateBatch> result = new ArrayList<>();
+        for (PersisterStateBatch batch : current) {
+            if (!ShareTransactionState.overlaps(batch, replacement)) {
+                result.add(batch);
+            } else {
+                if (batch.firstOffset() < replacement.firstOffset()) {
+                    result.add(new PersisterStateBatch(batch.firstOffset(), replacement.firstOffset() - 1,
+                        batch.deliveryState(), batch.deliveryCount()));
+                }
+                if (batch.lastOffset() > replacement.lastOffset()) {
+                    result.add(new PersisterStateBatch(replacement.lastOffset() + 1, batch.lastOffset(),
+                        batch.deliveryState(), batch.deliveryCount()));
+                }
+            }
+        }
+        result.add(replacement);
+        return new PersisterStateBatchCombiner(List.of(), result, 0).combineStateBatches();
     }
 
     private static ApiMessage messageOrNull(ApiMessageAndVersion apiMessageAndVersion) {

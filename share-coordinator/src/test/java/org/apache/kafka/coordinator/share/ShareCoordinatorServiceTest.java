@@ -38,6 +38,7 @@ import org.apache.kafka.common.metadata.RemoveTopicRecord;
 import org.apache.kafka.common.metrics.Metrics;
 import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.TransactionResult;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.common.utils.Utils;
 import org.apache.kafka.common.utils.internals.LogContext;
@@ -64,13 +65,18 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.apache.kafka.coordinator.common.runtime.TestUtil.requestContext;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -100,6 +106,151 @@ class ShareCoordinatorServiceTest {
         when(image.features().finalizedVersions().getOrDefault(eq(ShareVersion.FEATURE_NAME), anyShort()))
             .thenReturn((short) 1);
         return image;
+    }
+
+    @Test
+    public void testTransactionCompletionReturnsNativeDurabilityFuture() {
+        CoordinatorRuntime<ShareCoordinatorShard, CoordinatorRecord> runtime = mockRuntime();
+        ShareCoordinatorService service = transactionalService(runtime);
+        TopicPartition tp = new TopicPartition(Topic.SHARE_GROUP_STATE_TOPIC_NAME, 0);
+        CompletableFuture<Void> durable = new CompletableFuture<>();
+        when(runtime.scheduleTransactionCompletion("complete-share-transaction", tp, 17L,
+            (short) 3, 8, TransactionResult.COMMIT, (short) 2)).thenReturn(durable);
+
+        CompletableFuture<Void> result = service.completeTransaction(tp, 17L, (short) 3, 8, TransactionResult.COMMIT, (short) 2);
+        assertSame(durable, result);
+        assertFalse(result.isDone());
+        durable.complete(null);
+        assertTrue(result.isDone());
+        assertInstanceOf(IllegalArgumentException.class, assertThrows(CompletionException.class, () -> service.completeTransaction(
+            new TopicPartition("other", 0), 17L, (short) 3, 8, TransactionResult.COMMIT, (short) 2).join()).getCause());
+        service.shutdown();
+        assertInstanceOf(CoordinatorNotAvailableException.class, assertThrows(CompletionException.class, () -> service.completeTransaction(
+            tp, 17L, (short) 3, 8, TransactionResult.COMMIT, (short) 2).join()).getCause());
+    }
+
+    @Test
+    public void testCompletionHintFollowsDurabilityAndDoesNotDelayMarker() {
+        CoordinatorRuntime<ShareCoordinatorShard, CoordinatorRecord> runtime = mockRuntime();
+        TopicPartition tp = new TopicPartition(Topic.SHARE_GROUP_STATE_TOPIC_NAME, 0);
+        CompletableFuture<Void> durable = new CompletableFuture<>();
+        CompletableFuture<Optional<ShareCoordinatorShard.TransactionCompletion>> metadata = new CompletableFuture<>();
+        ShareCoordinatorShard.TransactionCompletion completion = new ShareCoordinatorShard.TransactionCompletion(
+            "txn", 17L, (short) 2, Set.of(SharePartitionKey.getInstance("group", Uuid.randomUuid(), 0)));
+        AtomicInteger notifications = new AtomicInteger();
+        ShareCoordinatorService service = new ShareCoordinatorService(new LogContext(), ShareCoordinatorTestConfig.testConfig(),
+            runtime, new ShareCoordinatorMetrics(), Time.SYSTEM, new MockTimer(), mock(PartitionWriter.class), (value, result) -> {
+                assertEquals(completion, value);
+                assertEquals(TransactionResult.COMMIT, result);
+                notifications.incrementAndGet();
+            });
+        service.startup(() -> 1);
+        when(runtime.scheduleTransactionCompletion("complete-share-transaction", tp, 17L,
+            (short) 3, 8, TransactionResult.COMMIT, (short) 2)).thenReturn(durable);
+        when(runtime.<Optional<ShareCoordinatorShard.TransactionCompletion>>scheduleWriteOperation(
+            eq("read-share-transaction-completion"), eq(tp), any())).thenAnswer(invocation -> {
+                CoordinatorRuntime.CoordinatorWriteOperation<ShareCoordinatorShard,
+                    Optional<ShareCoordinatorShard.TransactionCompletion>, CoordinatorRecord> operation = invocation.getArgument(2);
+                ShareCoordinatorShard shard = mock(ShareCoordinatorShard.class);
+                when(shard.transactionCompletion(17L, (short) 2)).thenReturn(Optional.of(completion));
+                assertEquals(Optional.of(completion), operation.generateRecordsAndResult(shard).response());
+                return metadata;
+            });
+
+        assertSame(durable, service.completeTransaction(tp, 17L, (short) 3, 8, TransactionResult.COMMIT, (short) 2));
+        verify(runtime, times(0)).scheduleWriteOperation(eq("read-share-transaction-completion"), eq(tp), any());
+        durable.complete(null);
+        assertTrue(durable.isDone());
+        assertEquals(0, notifications.get());
+        metadata.complete(Optional.of(completion));
+        assertEquals(1, notifications.get());
+
+        CompletableFuture<Void> failed = new CompletableFuture<>();
+        when(runtime.scheduleTransactionCompletion("complete-share-transaction", tp, 17L,
+            (short) 3, 8, TransactionResult.COMMIT, (short) 2)).thenReturn(failed);
+        assertSame(failed, service.completeTransaction(tp, 17L, (short) 3, 8, TransactionResult.COMMIT, (short) 2));
+        failed.completeExceptionally(Errors.NOT_COORDINATOR.exception());
+        verify(runtime).scheduleWriteOperation(eq("read-share-transaction-completion"), eq(tp), any());
+        assertEquals(1, notifications.get());
+    }
+
+    @Test
+    public void testTransactionalWritePreservesIdentityAndWaitsForDurability() {
+        CoordinatorRuntime<ShareCoordinatorShard, CoordinatorRecord> runtime = mockRuntime();
+        ShareCoordinatorService service = transactionalService(runtime);
+        Uuid topicId = Uuid.randomUuid();
+        Uuid incarnation = Uuid.randomUuid();
+        Uuid writer = Uuid.randomUuid();
+        WriteShareGroupStateRequestData request = new WriteShareGroupStateRequestData().setGroupId("group")
+            .setTransactionalId("txn").setProducerId(17L).setProducerEpoch((short) 2)
+            .setTopics(List.of(new WriteShareGroupStateRequestData.WriteStateData().setTopicId(topicId)
+                .setPartitions(List.of(new WriteShareGroupStateRequestData.PartitionData().setPartition(0)
+                    .setStateEpoch(1).setLeaderEpoch(4).setStateIncarnationId(incarnation).setWriterGeneration(writer)
+                    .setStartOffset(-1).setDeliveryCompleteCount(-1).setStateBatches(List.of(
+                        new WriteShareGroupStateRequestData.StateBatch().setFirstOffset(3).setLastOffset(6)
+                            .setDeliveryCount((short) 1).setDeliveryState((byte) 2)))))));
+        CompletableFuture<WriteShareGroupStateResponseData> durable = new CompletableFuture<>();
+        ShareCoordinatorShard shard = mock(ShareCoordinatorShard.class);
+        when(runtime.scheduleTransactionalWriteOperation(eq("write-transactional-share-group-state"),
+            eq(new TopicPartition(Topic.SHARE_GROUP_STATE_TOPIC_NAME, 0)), eq("txn"), eq(17L), eq((short) 2), any(),
+            eq(PartitionWriter.TransactionVerificationMode.ADD_PARTITION))).thenAnswer(invocation -> {
+                CoordinatorRuntime.CoordinatorWriteOperation<ShareCoordinatorShard, WriteShareGroupStateResponseData, CoordinatorRecord> op =
+                    invocation.getArgument(5);
+                op.generateRecordsAndResult(shard);
+                return durable;
+            });
+
+        CompletableFuture<WriteShareGroupStateResponseData> result = service.writeState(null, request);
+        assertFalse(result.isDone());
+        verify(shard).writeState(eq(request));
+        durable.complete(new WriteShareGroupStateResponseData().setResults(List.of(
+            new WriteShareGroupStateResponseData.WriteStateResult().setTopicId(topicId).setPartitions(List.of(
+                new WriteShareGroupStateResponseData.PartitionResult().setPartition(0))))));
+        assertEquals(Errors.NONE.code(), result.join().results().get(0).partitions().get(0).errorCode());
+
+        request.setTransactionalId(null);
+        assertEquals(Errors.INVALID_REQUEST.code(), service.writeState(null, request).join()
+            .results().get(0).partitions().get(0).errorCode());
+    }
+
+    @Test
+    public void testOldReadVersionCannotHideTransactionalState() {
+        CoordinatorRuntime<ShareCoordinatorShard, CoordinatorRecord> runtime = mockRuntime();
+        ShareCoordinatorService service = transactionalService(runtime);
+        Uuid topicId = Uuid.randomUuid();
+        ReadShareGroupStateRequestData request = new ReadShareGroupStateRequestData().setGroupId("group").setTopics(List.of(
+            new ReadShareGroupStateRequestData.ReadStateData().setTopicId(topicId).setPartitions(List.of(
+                new ReadShareGroupStateRequestData.PartitionData().setPartition(0).setLeaderEpoch(1)))));
+        ReadShareGroupStateResponseData response = new ReadShareGroupStateResponseData().setResults(List.of(
+            new ReadShareGroupStateResponseData.ReadStateResult().setTopicId(topicId).setPartitions(List.of(
+                new ReadShareGroupStateResponseData.PartitionResult().setPartition(0).setStateIncarnationId(Uuid.randomUuid())
+                    .setWriterGeneration(Uuid.randomUuid()).setPendingTransactions(List.of(
+                        new ReadShareGroupStateResponseData.PendingTransaction().setTransactionalId("txn")
+                            .setProducerId(17L).setProducerEpoch((short) 2)))))));
+        when(runtime.scheduleWriteOperation(eq("read-update-leader-epoch-state"),
+            eq(new TopicPartition(Topic.SHARE_GROUP_STATE_TOPIC_NAME, 0)), any()))
+            .thenReturn(CompletableFuture.completedFuture(response));
+
+        for (short version : new short[] {0, 1, 2}) {
+            ReadShareGroupStateResponseData result = service.readState(requestContext(ApiKeys.READ_SHARE_GROUP_STATE, version), request).join();
+            assertEquals(version < 2 ? Errors.UNSUPPORTED_VERSION.code() : Errors.NONE.code(),
+                result.results().get(0).partitions().get(0).errorCode());
+            if (version == 2) assertEquals(response, result);
+        }
+        assertEquals(response, service.readState(null, request).join());
+        response.results().get(0).partitions().get(0).setStateIncarnationId(Uuid.ZERO_UUID)
+            .setWriterGeneration(Uuid.ZERO_UUID).setPendingTransactions(List.of());
+        for (short version : new short[] {0, 1, 2}) {
+            assertEquals(response, service.readState(requestContext(ApiKeys.READ_SHARE_GROUP_STATE, version), request).join());
+        }
+        assertEquals("false", service.shareGroupStateTopicConfigs().get(TopicConfig.UNCLEAN_LEADER_ELECTION_ENABLE_CONFIG));
+    }
+
+    private ShareCoordinatorService transactionalService(CoordinatorRuntime<ShareCoordinatorShard, CoordinatorRecord> runtime) {
+        ShareCoordinatorService service = new ShareCoordinatorService(new LogContext(), ShareCoordinatorTestConfig.testConfig(),
+            runtime, new ShareCoordinatorMetrics(), Time.SYSTEM, new MockTimer(), mock(PartitionWriter.class));
+        service.startup(() -> 1);
+        return service;
     }
 
     @Test
@@ -2180,7 +2331,8 @@ class ShareCoordinatorServiceTest {
             TopicConfig.COMPRESSION_TYPE_CONFIG,
             TopicConfig.SEGMENT_BYTES_CONFIG,
             TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG,
-            TopicConfig.RETENTION_MS_CONFIG
+            TopicConfig.RETENTION_MS_CONFIG,
+            TopicConfig.UNCLEAN_LEADER_ELECTION_ENABLE_CONFIG
         );
         assertEquals(propNames, service.shareGroupStateTopicConfigs().keySet());
 

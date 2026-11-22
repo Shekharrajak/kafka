@@ -850,6 +850,11 @@ public class PersisterStateManager {
                 WriteShareGroupStateResponseData.PartitionResult::partition);
         }
 
+        protected boolean isRetryableWriteError(Errors error) {
+            return error == Errors.COORDINATOR_NOT_AVAILABLE || error == Errors.COORDINATOR_LOAD_IN_PROGRESS ||
+                error == Errors.NOT_COORDINATOR || error == Errors.UNKNOWN_TOPIC_OR_PARTITION;
+        }
+
         @Override
         protected void handleRequestResponse(ClientResponse response) {
             log().debug("Write state response received - {}", response);
@@ -866,37 +871,28 @@ public class PersisterStateManager {
                             errorMessage = error.message();
                         }
 
-                        switch (error) {
-                            case NONE:
-                                writeStateBackoff.resetAttempts();
-                                WriteShareGroupStateResponseData.WriteStateResult result = WriteShareGroupStateResponse.toResponseWriteStateResult(
-                                    partitionKey().topicId(),
-                                    List.of(partitionResult)
-                                );
-                                this.result.complete(new WriteShareGroupStateResponse(
-                                    new WriteShareGroupStateResponseData().setResults(List.of(result))));
-                                return;
-
-                            // check retriable errors
-                            case COORDINATOR_NOT_AVAILABLE:
-                            case COORDINATOR_LOAD_IN_PROGRESS:
-                            case NOT_COORDINATOR:
-                            case UNKNOWN_TOPIC_OR_PARTITION:
-                                log().debug("Received retriable error in write state RPC for key {}: {}", partitionKey(), errorMessage);
-                                if (!writeStateBackoff.canAttempt()) {
-                                    log().error("Exhausted max retries for write state RPC for key {} without success.", partitionKey());
-                                    requestErrorResponse(error, new Exception("Exhausted max retries to complete write state RPC without success."));
-                                    return;
-                                }
-                                super.resetCoordinatorNode();
-                                timer.add(new PersisterTimerTask(writeStateBackoff.backOff(), this));
-                                return;
-
-                            default:
-                                log().error("Unable to perform write state RPC for key {}: {}", partitionKey(), errorMessage);
-                                requestErrorResponse(error, new Exception(errorMessage));
-                                return;
+                        if (error == Errors.NONE) {
+                            writeStateBackoff.resetAttempts();
+                            WriteShareGroupStateResponseData.WriteStateResult result = WriteShareGroupStateResponse.toResponseWriteStateResult(
+                                partitionKey().topicId(), List.of(partitionResult));
+                            this.result.complete(new WriteShareGroupStateResponse(
+                                new WriteShareGroupStateResponseData().setResults(List.of(result))));
+                            return;
                         }
+                        if (isRetryableWriteError(error)) {
+                            log().debug("Received retriable error in write state RPC for key {}: {}", partitionKey(), errorMessage);
+                            if (!writeStateBackoff.canAttempt()) {
+                                log().error("Exhausted max retries for write state RPC for key {} without success.", partitionKey());
+                                requestErrorResponse(error, new Exception("Exhausted max retries to complete write state RPC without success."));
+                                return;
+                            }
+                            super.resetCoordinatorNode();
+                            timer.add(new PersisterTimerTask(writeStateBackoff.backOff(), this));
+                            return;
+                        }
+                        log().error("Unable to perform write state RPC for key {}: {}", partitionKey(), errorMessage);
+                        requestErrorResponse(error, new Exception(errorMessage));
+                        return;
                     }
 
                     // no response found specific topic partition

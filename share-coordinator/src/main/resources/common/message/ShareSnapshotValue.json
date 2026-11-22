@@ -31,6 +31,10 @@
     // DeliveryCompleteCount was added in Apache Kafka 4.2 (KIP-1226).
     { "name": "DeliveryCompleteCount", "type": "int32", "versions": "0+", "taggedVersions": "0+", "tag": 0, "default": "-1",
       "about": "The number of offsets greater than or equal to share-partition start offset for which delivery has been completed." },
+    { "name": "StateIncarnationId", "type": "uuid", "versions": "0+", "taggedVersions": "0+", "tag": 1,
+      "about": "The identity of the logical share state." },
+    { "name": "WriterGeneration", "type": "uuid", "versions": "0+", "taggedVersions": "0+", "tag": 2,
+      "about": "The current writer generation for this share-partition." },
     { "name": "CreateTimestamp", "type": "int64", "versions": "0+",
       "about": "The time at which the state was created." },
     { "name": "WriteTimestamp", "type": "int64", "versions": "0+",
