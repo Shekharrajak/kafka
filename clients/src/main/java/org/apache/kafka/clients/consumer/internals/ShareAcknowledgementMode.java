@@ -27,7 +27,7 @@ import java.util.stream.Collectors;
 
 public class ShareAcknowledgementMode {
     public enum AcknowledgementMode {
-        IMPLICIT, EXPLICIT;
+        IMPLICIT, EXPLICIT, TRANSACTIONAL;
 
         @Override
         public String toString() {
@@ -39,6 +39,7 @@ public class ShareAcknowledgementMode {
 
     public static final ShareAcknowledgementMode IMPLICIT = new ShareAcknowledgementMode(AcknowledgementMode.IMPLICIT);
     public static final ShareAcknowledgementMode EXPLICIT = new ShareAcknowledgementMode(AcknowledgementMode.EXPLICIT);
+    public static final ShareAcknowledgementMode TRANSACTIONAL = new ShareAcknowledgementMode(AcknowledgementMode.TRANSACTIONAL);
 
     private ShareAcknowledgementMode(AcknowledgementMode acknowledgementMode) {
         this.acknowledgementMode = acknowledgementMode;
@@ -59,6 +60,8 @@ public class ShareAcknowledgementMode {
                     return IMPLICIT;
                 case EXPLICIT:
                     return EXPLICIT;
+                case TRANSACTIONAL:
+                    return TRANSACTIONAL;
                 default:
                     throw new IllegalArgumentException("Invalid acknowledgement mode: " + acknowledgementMode);
             }
@@ -102,7 +105,7 @@ public class ShareAcknowledgementMode {
                 fromString(acknowledgementMode);
             } catch (Exception e) {
                 throw new ConfigException(name, value, "Invalid value `" + acknowledgementMode + "` for configuration " +
-                        name + ". The value must either be 'implicit' or 'explicit'.");
+                        name + ". The value must be 'implicit', 'explicit', or 'transactional'.");
             }
         }
 

@@ -19,6 +19,8 @@ package org.apache.kafka.clients.consumer.internals;
 import org.apache.kafka.clients.consumer.AcknowledgeType;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.TopicIdPartition;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.errors.UnsupportedVersionException;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -28,10 +30,14 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class ShareInFlightBatch<K, V> {
     private final int nodeId;
     private final TopicIdPartition partition;
+    private final Uuid memberId;
+    private Map<Long, Uuid> acquisitionIds;
+    private final AtomicInteger transactionalAcknowledgements = new AtomicInteger();
     private final Map<Long, ConsumerRecord<K, V>> inFlightRecords;
     private Map<Long, ConsumerRecord<K, V>> renewingRecords;
     private Map<Long, ConsumerRecord<K, V>> renewedRecords;
@@ -43,8 +49,13 @@ public class ShareInFlightBatch<K, V> {
     private boolean checkForRenewAcknowledgements = false;
 
     public ShareInFlightBatch(int nodeId, TopicIdPartition partition, Optional<Integer> acquisitionLockTimeoutMs) {
+        this(nodeId, partition, acquisitionLockTimeoutMs, Uuid.ZERO_UUID);
+    }
+
+    public ShareInFlightBatch(int nodeId, TopicIdPartition partition, Optional<Integer> acquisitionLockTimeoutMs, Uuid memberId) {
         this.nodeId = nodeId;
         this.partition = partition;
+        this.memberId = memberId;
         this.inFlightRecords = new TreeMap<>();
         this.acknowledgedRecords = new TreeSet<>();
         this.acknowledgements = Acknowledgements.empty();
@@ -87,6 +98,41 @@ public class ShareInFlightBatch<K, V> {
 
     public void addRecord(ConsumerRecord<K, V> record) {
         inFlightRecords.put(record.offset(), record);
+    }
+
+    public void addRecord(ConsumerRecord<K, V> record, Uuid acquisitionId) {
+        addRecord(record);
+        if (!Uuid.ZERO_UUID.equals(acquisitionId)) {
+            if (acquisitionIds == null) {
+                acquisitionIds = new HashMap<>();
+            }
+            acquisitionIds.put(record.offset(), acquisitionId);
+        }
+    }
+
+    TransactionalShareAcknowledgement transactionalAcknowledgement(ConsumerRecord<K, V> record, AcknowledgeType type) {
+        if (inFlightRecords.get(record.offset()) != record) {
+            throw new IllegalStateException("The exact record returned by poll must be acknowledged");
+        }
+        Uuid acquisitionId = acquisitionIds == null ? null : acquisitionIds.get(record.offset());
+        if (acquisitionId == null || Uuid.ZERO_UUID.equals(memberId)) {
+            throw new UnsupportedVersionException("Transactional acknowledgements require acquisition identity from ShareFetch version 3");
+        }
+        return new TransactionalShareAcknowledgement(nodeId, memberId, partition, record.offset(), acquisitionId, type.id, transactionalAcknowledgements);
+    }
+
+    void removeTransactionalRecord(ConsumerRecord<K, V> record, TransactionalShareAcknowledgement acknowledgement) {
+        if (inFlightRecords.get(record.offset()) != record) {
+            throw new IllegalStateException("The record is no longer in flight");
+        }
+        inFlightRecords.remove(record.offset());
+        acquisitionIds.remove(record.offset());
+        transactionalAcknowledgements.incrementAndGet();
+        acknowledgement.retain();
+    }
+
+    boolean hasTransactionalAcknowledgements() {
+        return transactionalAcknowledgements.get() > 0;
     }
 
     public void addGap(long offset) {
@@ -189,7 +235,7 @@ public class ShareInFlightBatch<K, V> {
     }
 
     public boolean isEmpty() {
-        return inFlightRecords.isEmpty() && acknowledgements.isEmpty();
+        return inFlightRecords.isEmpty() && acknowledgements.isEmpty() && !hasTransactionalAcknowledgements();
     }
 
     public void setException(ShareInFlightBatchException exception) {

@@ -21,6 +21,7 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.errors.CorruptRecordException;
 import org.apache.kafka.common.errors.RecordDeserializationException;
 import org.apache.kafka.common.errors.SerializationException;
@@ -62,6 +63,7 @@ public class ShareCompletedFetch {
     final ShareFetchResponseData.PartitionData partitionData;
     final Optional<Integer> acquisitionLockTimeoutMs;
     final short requestVersion;
+    private final Uuid memberId;
 
     private final Logger log;
     private final BufferSupplier decompressionBufferSupplier;
@@ -89,6 +91,19 @@ public class ShareCompletedFetch {
                         final Optional<Integer> acquisitionLockTimeoutMs,
                         final ShareFetchMetricsAggregator metricsAggregator,
                         final short requestVersion) {
+        this(logContext, decompressionBufferSupplier, nodeId, partition, partitionData, acquisitionLockTimeoutMs,
+            metricsAggregator, requestVersion, Uuid.ZERO_UUID);
+    }
+
+    ShareCompletedFetch(final LogContext logContext,
+                        final BufferSupplier decompressionBufferSupplier,
+                        final int nodeId,
+                        final TopicIdPartition partition,
+                        final ShareFetchResponseData.PartitionData partitionData,
+                        final Optional<Integer> acquisitionLockTimeoutMs,
+                        final ShareFetchMetricsAggregator metricsAggregator,
+                        final short requestVersion,
+                        final Uuid memberId) {
         this.log = logContext.logger(org.apache.kafka.clients.consumer.internals.ShareCompletedFetch.class);
         this.decompressionBufferSupplier = decompressionBufferSupplier;
         this.nodeId = nodeId;
@@ -97,6 +112,7 @@ public class ShareCompletedFetch {
         this.acquisitionLockTimeoutMs = acquisitionLockTimeoutMs;
         this.metricsAggregator = metricsAggregator;
         this.requestVersion = requestVersion;
+        this.memberId = memberId;
         this.batches = ShareFetchResponse.recordsOrFail(partitionData).batches().iterator();
         this.acquiredRecordList = buildAcquiredRecordList(partitionData.acquiredRecords());
         this.nextAcquired = null;
@@ -118,7 +134,8 @@ public class ShareCompletedFetch {
                     log.error("Duplicate acquired record offset {} found in share fetch response for partition {}. " +
                             "This indicates a broker processing issue.", offset, partition.topicPartition());
                 } else {
-                    acquiredRecordList.add(new OffsetAndDeliveryCount(offset, acquiredRecords.deliveryCount()));
+                    acquiredRecordList.add(new OffsetAndDeliveryCount(offset, acquiredRecords.deliveryCount(),
+                        requestVersion >= 3 ? acquiredRecords.acquisitionId() : Uuid.ZERO_UUID));
                 }
             }
         });
@@ -143,14 +160,16 @@ public class ShareCompletedFetch {
      * in-flight records and its acknowledgements have been taken by the background thread to be sent.
      */
     void trackDeliveredBatch(ShareInFlightBatch<?, ?> inFlightBatch) {
-        if (deliveredBatch == null || (deliveredBatch.numRecords() == 0 && !deliveredBatch.hasRenewals())) {
+        if (deliveredBatch == null || (deliveredBatch.numRecords() == 0 && !deliveredBatch.hasRenewals()
+            && !deliveredBatch.hasTransactionalAcknowledgements())) {
             deliveredBatch = inFlightBatch;
         }
     }
 
     public boolean hasPendingAcknowledgements() {
         // Records being renewed are removed and readded to the in-flight set as the renewals are confirmed.
-        return deliveredBatch != null && (deliveredBatch.numRecords() > 0 || deliveredBatch.hasRenewals());
+        return deliveredBatch != null && (deliveredBatch.numRecords() > 0 || deliveredBatch.hasRenewals()
+            || deliveredBatch.hasTransactionalAcknowledgements());
     }
 
     /**
@@ -193,7 +212,7 @@ public class ShareCompletedFetch {
                                                  final int maxRecords,
                                                  final boolean checkCrcs) {
         // Creating an empty ShareInFlightBatch
-        ShareInFlightBatch<K, V> inFlightBatch = new ShareInFlightBatch<>(nodeId, partition, acquisitionLockTimeoutMs);
+        ShareInFlightBatch<K, V> inFlightBatch = new ShareInFlightBatch<>(nodeId, partition, acquisitionLockTimeoutMs, memberId);
         trackDeliveredBatch(inFlightBatch);
 
         if (cachedBatchException != null) {
@@ -238,7 +257,7 @@ public class ShareCompletedFetch {
                         TimestampType timestampType = currentBatch.timestampType();
                         ConsumerRecord<K, V> record = parseRecord(deserializers, partition, leaderEpoch,
                                 timestampType, lastRecord, nextAcquired.deliveryCount);
-                        inFlightBatch.addRecord(record);
+                        inFlightBatch.addRecord(record, nextAcquired.acquisitionId);
                         recordsRead++;
                         bytesRead += lastRecord.sizeInBytes();
                         recordsInBatch++;
@@ -444,10 +463,12 @@ public class ShareCompletedFetch {
     private static class OffsetAndDeliveryCount {
         final long offset;
         final short deliveryCount;
+        final Uuid acquisitionId;
 
-        OffsetAndDeliveryCount(long offset, short deliveryCount) {
+        OffsetAndDeliveryCount(long offset, short deliveryCount, Uuid acquisitionId) {
             this.offset = offset;
             this.deliveryCount = deliveryCount;
+            this.acquisitionId = acquisitionId;
         }
 
         @Override

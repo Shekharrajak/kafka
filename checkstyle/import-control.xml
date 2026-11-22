@@ -233,6 +233,7 @@
 
     <subpackage name="consumer">
       <allow pkg="org.apache.kafka.clients.consumer" />
+      <allow class="org.apache.kafka.clients.producer.KafkaProducer" exact-match="true" />
 
       <subpackage name="internals">
         <allow pkg="org.apache.kafka.clients" />

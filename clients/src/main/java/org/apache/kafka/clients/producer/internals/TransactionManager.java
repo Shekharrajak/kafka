@@ -79,6 +79,7 @@ import org.apache.kafka.common.utils.internals.ProducerIdAndEpoch;
 
 import org.slf4j.Logger;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -87,10 +88,13 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.OptionalInt;
 import java.util.OptionalLong;
 import java.util.PriorityQueue;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.function.Supplier;
 
 /**
@@ -129,6 +133,11 @@ public class TransactionManager {
     private final Set<TopicPartition> pendingPartitionsInTransaction;
     private final Set<TopicPartition> partitionsInTransaction;
     private PendingStateTransition pendingTransition;
+    private ShareTransactionRegistration shareTransactionRegistration;
+    private ShareTransactionState shareTransactionState;
+    private long shareTransactionSequence;
+    private final ArrayDeque<Runnable> shareTransactionCallbacks = new ArrayDeque<>();
+    private final Object shareTransactionCallbackLock = new Object();
 
     // This is used by the TxnRequestHandlers to control how long to back off before a given request is retried.
     // For instance, this value is lowered by the AddPartitionsToTxnHandler when it receives a CONCURRENT_TRANSACTIONS
@@ -327,6 +336,9 @@ public class TransactionManager {
         boolean keepPreparedTxn
     ) {
         maybeFailWithError();
+        if (keepPreparedTxn && shareTransactionRegistration != null) {
+            throw new IllegalStateException("Prepared transactions cannot be restored with a share consumer bound");
+        }
 
         boolean isEpochBump = producerIdAndEpoch != ProducerIdAndEpoch.NONE;
         return handleCachedTransactionRequestResult(() -> {
@@ -374,11 +386,228 @@ public class TransactionManager {
         ensureTransactional();
         throwIfPendingState(TransactionOperation.PREPARE_TRANSACTION);
         maybeFailWithError();
+        ensureNoShareTransactionParticipant();
         transitionTo(State.PREPARED_TRANSACTION);
         this.preparedTxnState = new ProducerIdAndEpoch(
             this.producerIdAndEpoch.producerId,
             this.producerIdAndEpoch.epoch
         );
+    }
+
+    public synchronized void ensureNoShareTransactionParticipant() {
+        if (shareTransactionRegistration != null) {
+            throw new IllegalStateException("Transactions cannot be prepared with a share consumer bound");
+        }
+    }
+
+    public synchronized ShareTransactionParticipant.Registration registerShareTransactionParticipant(
+        ShareTransactionParticipant participant,
+        Runnable wakeup
+    ) {
+        ensureTransactional();
+        maybeFailWithError();
+        Objects.requireNonNull(participant, "participant cannot be null");
+        Objects.requireNonNull(wakeup, "wakeup cannot be null");
+        if (shareTransactionRegistration != null && !shareTransactionRegistration.closed) {
+            if (shareTransactionRegistration.participant == participant) {
+                return shareTransactionRegistration;
+            }
+            throw new IllegalStateException("Only one share consumer can be bound to a producer");
+        }
+        if (hasOngoingTransaction() || isPrepared() || currentState == State.INITIALIZING) {
+            throw new IllegalStateException("A share consumer cannot be bound while a transaction is active");
+        }
+        shareTransactionRegistration = new ShareTransactionRegistration(participant, wakeup);
+        return shareTransactionRegistration;
+    }
+
+    public void runShareTransactionCallbacks() {
+        synchronized (shareTransactionCallbackLock) {
+            drainShareTransactionCallbacks();
+        }
+    }
+
+    private void drainShareTransactionCallbacks() {
+        List<Runnable> callbacks;
+        synchronized (this) {
+            if (shareTransactionState != null && currentState == State.COMMITTING_TRANSACTION
+                && shareTransactionState.pendingReservations == 0 && !shareTransactionState.stageStarted) {
+                ShareTransactionState transaction = shareTransactionState;
+                transaction.stageStarted = true;
+                transactionStarted = true;
+                shareTransactionCallbacks.add(() -> stageShareTransaction(transaction));
+            }
+            if (shareTransactionCallbacks.isEmpty()) {
+                return;
+            }
+            callbacks = new ArrayList<>(shareTransactionCallbacks);
+            shareTransactionCallbacks.clear();
+        }
+        for (Runnable callback : callbacks) {
+            try {
+                callback.run();
+            } catch (RuntimeException e) {
+                log.warn("Share transaction participant callback failed", e);
+            }
+        }
+    }
+
+    private void stageShareTransaction(ShareTransactionState transaction) {
+        try {
+            CompletableFuture<Void> result = Objects.requireNonNull(
+                transaction.registration.participant.stage(transaction.context), "stage future cannot be null");
+            result.whenComplete((ignored, error) -> {
+                synchronized (TransactionManager.this) {
+                    if (shareTransactionState == transaction) {
+                        transaction.stageCompleted = true;
+                        if (error != null && !hasFatalError()) {
+                            Throwable cause = error instanceof CompletionException ? error.getCause() : error;
+                            RuntimeException exception = cause instanceof RuntimeException
+                                ? (RuntimeException) cause : new KafkaException("Share acknowledgement staging failed", cause);
+                            if (exception instanceof InvalidProducerEpochException) {
+                                exception = Errors.PRODUCER_FENCED.exception();
+                            }
+                            maybeTransitionToErrorState(exception);
+                        }
+                    }
+                }
+                transaction.registration.wakeup.run();
+            });
+        } catch (RuntimeException e) {
+            synchronized (this) {
+                if (shareTransactionState == transaction && !hasFatalError()) {
+                    transaction.stageCompleted = true;
+                    maybeTransitionToErrorState(e);
+                }
+            }
+            transaction.registration.wakeup.run();
+        }
+    }
+
+    private synchronized void completeShareTransaction(ShareTransactionParticipant.Outcome outcome, RuntimeException exception) {
+        if (shareTransactionState != null) {
+            ShareTransactionState transaction = shareTransactionState;
+            shareTransactionState = null;
+            shareTransactionCallbacks.add(() -> transaction.registration.participant.complete(transaction.context, outcome, exception));
+        }
+        if (shareTransactionRegistration != null && shareTransactionRegistration.closed) {
+            shareTransactionRegistration = null;
+        }
+    }
+
+    private synchronized void cancelShareTransactionReservations() {
+        if (shareTransactionState != null) {
+            shareTransactionState.reservationsCancelled = true;
+            shareTransactionState.pendingReservations = 0;
+        }
+    }
+
+    private final class ShareTransactionRegistration implements ShareTransactionParticipant.Registration {
+        private final ShareTransactionParticipant participant;
+        private final Runnable wakeup;
+        private boolean closed;
+
+        private ShareTransactionRegistration(ShareTransactionParticipant participant, Runnable wakeup) {
+            this.participant = participant;
+            this.wakeup = wakeup;
+        }
+
+        @Override
+        public ShareTransactionParticipant.Reservation reserve() {
+            synchronized (TransactionManager.this) {
+                ensureTransactional();
+                throwIfPendingState(TransactionOperation.SEND);
+                maybeFailWithError();
+                if (closed || shareTransactionRegistration != this) {
+                    throw new IllegalStateException("The share consumer binding has been closed");
+                }
+                if (currentState != State.IN_TRANSACTION) {
+                    throw new IllegalStateException("Share acknowledgements require an open transaction");
+                }
+                if (!isTransactionV2Enabled()) {
+                    throw new UnsupportedVersionException("Transactional share acknowledgements require transaction version 2");
+                }
+                if (shareTransactionState == null) {
+                    shareTransactionState = new ShareTransactionState(this, new ShareTransactionParticipant.TransactionContext(
+                        transactionalId, producerIdAndEpoch.producerId, producerIdAndEpoch.epoch, ++shareTransactionSequence));
+                }
+                shareTransactionState.pendingReservations++;
+                return new ShareTransactionReservation(shareTransactionState);
+            }
+        }
+
+        @Override
+        public void close() {
+            synchronized (TransactionManager.this) {
+                closed = true;
+                if (shareTransactionRegistration == this) {
+                    cancelShareTransactionReservations();
+                }
+                if (shareTransactionRegistration == this && shareTransactionState != null
+                    && !shareTransactionState.stageCompleted && !hasError()) {
+                    transitionToAbortableError(new KafkaException("The share consumer closed before acknowledgement staging completed"));
+                }
+                if (shareTransactionState == null && shareTransactionRegistration == this) {
+                    shareTransactionRegistration = null;
+                }
+            }
+            wakeup.run();
+        }
+    }
+
+    private final class ShareTransactionReservation implements ShareTransactionParticipant.Reservation {
+        private final ShareTransactionState transaction;
+        private boolean completed;
+
+        private ShareTransactionReservation(ShareTransactionState transaction) {
+            this.transaction = transaction;
+        }
+
+        @Override
+        public ShareTransactionParticipant.TransactionContext transaction() {
+            return transaction.context;
+        }
+
+        @Override
+        public void complete() {
+            finish(null);
+        }
+
+        @Override
+        public void fail(RuntimeException exception) {
+            finish(Objects.requireNonNull(exception, "exception cannot be null"));
+        }
+
+        private void finish(RuntimeException exception) {
+            synchronized (TransactionManager.this) {
+                if (completed) {
+                    return;
+                }
+                completed = true;
+                if (shareTransactionState != transaction || transaction.reservationsCancelled) {
+                    throw new IllegalStateException("The acknowledgement transaction is no longer active");
+                }
+                transaction.pendingReservations--;
+                if (exception != null && !hasFatalError()) {
+                    maybeTransitionToErrorState(exception);
+                }
+            }
+            transaction.registration.wakeup.run();
+        }
+    }
+
+    private static final class ShareTransactionState {
+        private final ShareTransactionRegistration registration;
+        private final ShareTransactionParticipant.TransactionContext context;
+        private int pendingReservations;
+        private boolean reservationsCancelled;
+        private boolean stageStarted;
+        private boolean stageCompleted;
+
+        private ShareTransactionState(ShareTransactionRegistration registration, ShareTransactionParticipant.TransactionContext context) {
+            this.registration = registration;
+            this.context = context;
+        }
     }
 
     public synchronized TransactionalRequestResult beginCommit() {
@@ -394,6 +623,7 @@ public class TransactionManager {
             if (currentState != State.ABORTABLE_ERROR)
                 maybeFailWithError();
             transitionTo(State.ABORTING_TRANSACTION);
+            cancelShareTransactionReservations();
 
             // We're aborting the transaction, so there should be no need to add new partitions
             newPartitionsInTransaction.clear();
@@ -572,6 +802,7 @@ public class TransactionManager {
     synchronized void transitionToFatalError(RuntimeException exception) {
         log.info("Transiting to fatal error state due to {}", exception.toString());
         transitionTo(State.FATAL_ERROR, exception);
+        completeShareTransaction(ShareTransactionParticipant.Outcome.UNKNOWN, exception);
 
         if (pendingTransition != null) {
             pendingTransition.result.fail(exception);
@@ -931,7 +1162,7 @@ public class TransactionManager {
             return null;
 
         // Do not send the EndTxn until all batches have been flushed
-        if (nextRequestHandler.isEndTxn() && hasIncompleteBatches)
+        if (nextRequestHandler.isEndTxn() && (hasIncompleteBatches || hasIncompleteShareAcknowledgements()))
             return null;
 
         pendingRequests.poll();
@@ -967,6 +1198,11 @@ public class TransactionManager {
         enqueueRequest(request);
     }
 
+    private synchronized boolean hasIncompleteShareAcknowledgements() {
+        return shareTransactionState != null && (shareTransactionState.pendingReservations > 0
+            || (currentState == State.COMMITTING_TRANSACTION && !shareTransactionState.stageCompleted));
+    }
+
     synchronized void authenticationFailed(AuthenticationException e) {
         for (TxnRequestHandler request : pendingRequests)
             request.fatalError(e);
@@ -979,6 +1215,10 @@ public class TransactionManager {
 
     synchronized void close() {
         KafkaException shutdownException = new KafkaException("The producer closed forcefully");
+        if (shareTransactionRegistration != null) {
+            shareTransactionRegistration.closed = true;
+        }
+        completeShareTransaction(ShareTransactionParticipant.Outcome.UNKNOWN, shutdownException);
         pendingRequests.forEach(handler ->
                 handler.fatalError(shutdownException));
         if (pendingTransition != null) {
@@ -1389,6 +1629,8 @@ public class TransactionManager {
     }
 
     private void resetTransactionState() {
+        completeShareTransaction(currentState == State.COMMITTING_TRANSACTION
+            ? ShareTransactionParticipant.Outcome.COMMITTED : ShareTransactionParticipant.Outcome.ABORTED, lastError);
         if (clientSideEpochBumpRequired) {
             transitionTo(State.INITIALIZING);
         } else {

@@ -28,6 +28,7 @@ import org.apache.kafka.clients.consumer.internals.events.BackgroundEventHandler
 import org.apache.kafka.clients.consumer.internals.events.ShareAcknowledgementEvent;
 import org.apache.kafka.clients.consumer.internals.events.ShareAcknowledgementEventHandler;
 import org.apache.kafka.clients.consumer.internals.metrics.AsyncConsumerMetrics;
+import org.apache.kafka.clients.producer.internals.ShareTransactionParticipant.TransactionContext;
 import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.IsolationLevel;
 import org.apache.kafka.common.KafkaException;
@@ -51,6 +52,8 @@ import org.apache.kafka.common.message.RequestHeaderData;
 import org.apache.kafka.common.message.ShareAcknowledgeResponseData;
 import org.apache.kafka.common.message.ShareFetchRequestData;
 import org.apache.kafka.common.message.ShareFetchResponseData;
+import org.apache.kafka.common.message.TxnShareAcknowledgeRequestData;
+import org.apache.kafka.common.message.TxnShareAcknowledgeResponseData;
 import org.apache.kafka.common.metrics.MetricConfig;
 import org.apache.kafka.common.metrics.Metrics;
 import org.apache.kafka.common.protocol.ApiKeys;
@@ -71,6 +74,8 @@ import org.apache.kafka.common.requests.ShareAcknowledgeResponse;
 import org.apache.kafka.common.requests.ShareFetchRequest;
 import org.apache.kafka.common.requests.ShareFetchResponse;
 import org.apache.kafka.common.requests.ShareRequestMetadata;
+import org.apache.kafka.common.requests.TxnShareAcknowledgeRequest;
+import org.apache.kafka.common.requests.TxnShareAcknowledgeResponse;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 import org.apache.kafka.common.serialization.Deserializer;
 import org.apache.kafka.common.serialization.StringDeserializer;
@@ -132,6 +137,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 @SuppressWarnings({"ClassDataAbstractionCoupling", "ClassFanOutComplexity", "JavaNCSS"})
 public class ShareConsumeRequestManagerTest {
@@ -207,6 +213,89 @@ public class ShareConsumeRequestManagerTest {
 
     private int sendFetches() {
         return shareConsumeRequestManager.sendFetches();
+    }
+
+    @Test
+    public void testTransactionalStageBatchesByAcquisitionAndWaitsForResponse() {
+        buildRequestManager();
+        assignFromSubscribed(Set.of(tp0));
+        sendFetchAndVerifyResponse(records, acquiredRecords, Errors.NONE);
+        Uuid member = shareConsumeRequestManager.sessionHandler(0).transactionalAcknowledgementMetadata().memberId();
+        Uuid firstAcquisition = Uuid.randomUuid();
+        Uuid secondAcquisition = Uuid.randomUuid();
+        List<TransactionalShareAcknowledgement> acknowledgements = List.of(
+            new TransactionalShareAcknowledgement(0, member, tip0, 4L, secondAcquisition, AcknowledgeType.ACCEPT.id, new AtomicInteger()),
+            new TransactionalShareAcknowledgement(0, member, tip0, 2L, firstAcquisition, AcknowledgeType.ACCEPT.id, new AtomicInteger()),
+            new TransactionalShareAcknowledgement(0, member, tip0, 1L, firstAcquisition, AcknowledgeType.ACCEPT.id, new AtomicInteger()));
+        TransactionContext transaction = mock(TransactionContext.class);
+        when(transaction.transactionalId()).thenReturn("share-transaction");
+        when(transaction.producerId()).thenReturn(42L);
+        when(transaction.producerEpoch()).thenReturn((short) 3);
+        CompletableFuture<Void> stage = shareConsumeRequestManager.acknowledgeTransactional(transaction, acknowledgements, time.milliseconds() + 1000);
+        NetworkClientDelegate.PollResult result = shareConsumeRequestManager.poll(time.milliseconds());
+        assertEquals(1, result.unsentRequests.size());
+        NetworkClientDelegate.UnsentRequest request = result.unsentRequests.get(0);
+        TxnShareAcknowledgeRequestData data = ((TxnShareAcknowledgeRequest.Builder) request.requestBuilder()).build((short) 0).data();
+        assertEquals("share-transaction", data.transactionalId());
+        assertEquals(42L, data.producerId());
+        assertEquals(3, data.producerEpoch());
+        assertEquals(member.toString(), data.memberId());
+        assertTrue(data.shareSessionEpoch() > 0);
+        List<TxnShareAcknowledgeRequestData.AcknowledgementBatch> batches = data.topics().iterator().next().partitions().iterator().next().acknowledgementBatches();
+        assertEquals(2, batches.size());
+        assertEquals(1L, batches.get(0).firstOffset());
+        assertEquals(2L, batches.get(0).lastOffset());
+        assertEquals(firstAcquisition, batches.get(0).acquisitionId());
+        assertEquals(4L, batches.get(1).firstOffset());
+        assertEquals(secondAcquisition, batches.get(1).acquisitionId());
+        assertFalse(stage.isDone());
+        completeTransactionalStage(request, List.of(transactionalPartitionResponse(0, Errors.NONE)));
+        assertTrue(stage.isDone());
+        assertFalse(stage.isCompletedExceptionally());
+        assertTrue(completedAcknowledgements.isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    public void testTransactionalStageRejectsMissingOrDuplicatePartitionResponse(boolean duplicate) {
+        buildRequestManager();
+        assignFromSubscribed(Set.of(tp0));
+        sendFetchAndVerifyResponse(records, acquiredRecords, Errors.NONE);
+        Uuid member = shareConsumeRequestManager.sessionHandler(0).transactionalAcknowledgementMetadata().memberId();
+        CompletableFuture<Void> stage = shareConsumeRequestManager.acknowledgeTransactional(mock(TransactionContext.class),
+            List.of(new TransactionalShareAcknowledgement(0, member, tip0, 1L, Uuid.randomUuid(), AcknowledgeType.ACCEPT.id, new AtomicInteger())),
+            time.milliseconds() + 1000);
+        NetworkClientDelegate.UnsentRequest request = shareConsumeRequestManager.poll(time.milliseconds()).unsentRequests.get(0);
+        completeTransactionalStage(request, duplicate ? List.of(transactionalPartitionResponse(0, Errors.NONE), transactionalPartitionResponse(0, Errors.NONE)) : List.of());
+        assertTrue(stage.isCompletedExceptionally());
+    }
+
+    @Test
+    public void testTransactionalStageExpiresWithoutFallingBackToNormalAcknowledgement() {
+        buildRequestManager();
+        assignFromSubscribed(Set.of(tp0));
+        sendFetchAndVerifyResponse(records, acquiredRecords, Errors.NONE);
+        Uuid member = shareConsumeRequestManager.sessionHandler(0).transactionalAcknowledgementMetadata().memberId();
+        CompletableFuture<Void> stage = shareConsumeRequestManager.acknowledgeTransactional(mock(TransactionContext.class),
+            List.of(new TransactionalShareAcknowledgement(0, member, tip0, 1L, Uuid.randomUuid(), AcknowledgeType.ACCEPT.id, new AtomicInteger())),
+            time.milliseconds());
+        assertTrue(shareConsumeRequestManager.poll(time.milliseconds()).unsentRequests.isEmpty());
+        assertTrue(stage.isCompletedExceptionally());
+        assertTrue(completedAcknowledgements.isEmpty());
+    }
+
+    private TxnShareAcknowledgeResponseData.TxnShareAcknowledgePartitionResponse transactionalPartitionResponse(int partition, Errors error) {
+        return new TxnShareAcknowledgeResponseData.TxnShareAcknowledgePartitionResponse().setPartitionIndex(partition).setErrorCode(error.code());
+    }
+
+    private void completeTransactionalStage(NetworkClientDelegate.UnsentRequest request,
+                                           List<TxnShareAcknowledgeResponseData.TxnShareAcknowledgePartitionResponse> partitions) {
+        TxnShareAcknowledgeResponseData data = new TxnShareAcknowledgeResponseData();
+        data.responses().add(new TxnShareAcknowledgeResponseData.TxnShareAcknowledgeTopicResponse().setTopicId(topicId).setPartitions(partitions));
+        TxnShareAcknowledgeResponse response = new TxnShareAcknowledgeResponse(data);
+        request.future().complete(new ClientResponse(
+            new RequestHeader(ApiKeys.TXN_SHARE_ACKNOWLEDGE, (short) 0, "test", 0), request.handler(), "0",
+            time.milliseconds(), time.milliseconds(), false, null, null, response));
     }
 
     @Test

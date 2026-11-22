@@ -93,6 +93,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -103,6 +104,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
@@ -171,6 +174,383 @@ public class TransactionManagerTest {
         this.brokerNode = new Node(0, "localhost", 2211);
 
         initializeTransactionManager(Optional.of(transactionalId), false, false);
+    }
+
+    @Test
+    public void testShareAcknowledgementCommitWaitsForPublicationAndStaging() {
+        initializeTransactionManager(Optional.of(transactionalId), true);
+        doInitTransactions();
+        TestShareTransactionParticipant participant = new TestShareTransactionParticipant(transactionManager);
+        ShareTransactionParticipant.Registration registration =
+            transactionManager.registerShareTransactionParticipant(participant, () -> { });
+        transactionManager.beginTransaction();
+        ShareTransactionParticipant.Reservation first = registration.reserve();
+        ShareTransactionParticipant.Reservation second = registration.reserve();
+        first.complete();
+        TransactionalRequestResult commit = transactionManager.beginCommit();
+
+        transactionManager.runShareTransactionCallbacks();
+        assertTrue(participant.staged.isEmpty());
+        assertNull(transactionManager.nextRequest(false));
+        assertThrows(IllegalStateException.class, registration::reserve);
+
+        second.complete();
+        transactionManager.runShareTransactionCallbacks();
+        assertEquals(List.of(first.transaction()), participant.staged);
+        assertSame(first.transaction(), second.transaction());
+        assertEquals(transactionalId, first.transaction().transactionalId());
+        assertEquals(producerId, first.transaction().producerId());
+        assertEquals(epoch, first.transaction().producerEpoch());
+        assertNull(transactionManager.nextRequest(false));
+        assertSame(commit, transactionManager.beginCommit());
+        transactionManager.runShareTransactionCallbacks();
+        assertEquals(1, participant.staged.size());
+
+        participant.stageResult.complete(null);
+        completeShareTransactionRequest(TransactionResult.COMMIT);
+        commit.await(0, TimeUnit.MILLISECONDS, TEST_TIMEOUT_MSG);
+        transactionManager.runShareTransactionCallbacks();
+        assertEquals(List.of(ShareTransactionParticipant.Outcome.COMMITTED), participant.outcomes);
+    }
+
+    @Test
+    public void testShareAcknowledgementCompletionDrainWaitsForConcurrentDispatch() throws Exception {
+        initializeTransactionManager(Optional.of(transactionalId), true);
+        doInitTransactions();
+        CountDownLatch callbackEntered = new CountDownLatch(1);
+        CountDownLatch releaseCallback = new CountDownLatch(1);
+        AtomicInteger completions = new AtomicInteger();
+        ShareTransactionParticipant participant = new ShareTransactionParticipant() {
+            @Override
+            public CompletableFuture<Void> stage(TransactionContext transaction) {
+                return CompletableFuture.completedFuture(null);
+            }
+
+            @Override
+            public void complete(TransactionContext transaction, Outcome outcome, RuntimeException exception) {
+                assertFalse(Thread.holdsLock(transactionManager));
+                callbackEntered.countDown();
+                try {
+                    assertTrue(releaseCallback.await(5, TimeUnit.SECONDS));
+                } catch (InterruptedException e) {
+                    throw new AssertionError(e);
+                }
+                completions.incrementAndGet();
+            }
+        };
+        ShareTransactionParticipant.Registration registration = transactionManager.registerShareTransactionParticipant(participant, () -> { });
+        transactionManager.beginTransaction();
+        registration.reserve().complete();
+        TransactionalRequestResult commit = transactionManager.beginCommit();
+        transactionManager.runShareTransactionCallbacks();
+        completeShareTransactionRequest(TransactionResult.COMMIT);
+        commit.await(0, TimeUnit.MILLISECONDS, TEST_TIMEOUT_MSG);
+        CompletableFuture<Void> senderDispatch = CompletableFuture.runAsync(transactionManager::runShareTransactionCallbacks);
+        assertTrue(callbackEntered.await(5, TimeUnit.SECONDS));
+        CompletableFuture<Void> applicationDispatch = CompletableFuture.runAsync(transactionManager::runShareTransactionCallbacks);
+        try {
+            assertThrows(java.util.concurrent.TimeoutException.class, () -> applicationDispatch.get(100, TimeUnit.MILLISECONDS));
+        } finally {
+            releaseCallback.countDown();
+        }
+        senderDispatch.get(5, TimeUnit.SECONDS);
+        applicationDispatch.get(5, TimeUnit.SECONDS);
+        assertEquals(1, completions.get());
+    }
+
+    @Test
+    public void testShareAcknowledgementSenderWaitsForStaging() {
+        initializeTransactionManager(Optional.of(transactionalId), true);
+        doInitTransactions();
+        TestShareTransactionParticipant participant = new TestShareTransactionParticipant(transactionManager);
+        ShareTransactionParticipant.Registration registration =
+            transactionManager.registerShareTransactionParticipant(participant, () -> { });
+        transactionManager.beginTransaction();
+        registration.reserve().complete();
+        TransactionalRequestResult commit = transactionManager.beginCommit();
+
+        sender.runOnce();
+        assertEquals(1, participant.staged.size());
+        assertFalse(transactionManager.hasInFlightRequest());
+        assertFalse(commit.isCompleted());
+        sender.runOnce();
+        assertEquals(1, participant.staged.size());
+        assertFalse(transactionManager.hasInFlightRequest());
+
+        participant.stageResult.complete(null);
+        prepareEndTxnResponse(Errors.NONE, TransactionResult.COMMIT, producerId, epoch,
+            producerId, (short) (epoch + 1), false);
+        runUntil(commit::isCompleted);
+        commit.await(0, TimeUnit.MILLISECONDS, TEST_TIMEOUT_MSG);
+        sender.runOnce();
+        assertEquals(List.of(ShareTransactionParticipant.Outcome.COMMITTED), participant.outcomes);
+    }
+
+    @Test
+    public void testShareAcknowledgementCommitTimeoutRetainsFrozenCohort() {
+        initializeTransactionManager(Optional.of(transactionalId), true);
+        doInitTransactions();
+        TestShareTransactionParticipant participant = new TestShareTransactionParticipant(transactionManager);
+        ShareTransactionParticipant.Registration registration =
+            transactionManager.registerShareTransactionParticipant(participant, () -> { });
+        transactionManager.beginTransaction();
+        registration.reserve().complete();
+        TransactionalRequestResult commit = transactionManager.beginCommit();
+        transactionManager.runShareTransactionCallbacks();
+        assertThrows(TimeoutException.class, () -> commit.await(0, TimeUnit.MILLISECONDS, TEST_TIMEOUT_MSG));
+        assertThrows(IllegalStateException.class, transactionManager::beginAbort);
+        participant.stageResult.complete(null);
+        completeShareTransactionRequest(TransactionResult.COMMIT);
+        assertThrows(IllegalStateException.class, transactionManager::beginTransaction);
+        assertThrows(IllegalStateException.class, registration::reserve);
+        assertSame(commit, transactionManager.beginCommit());
+        commit.await(0, TimeUnit.MILLISECONDS, TEST_TIMEOUT_MSG);
+        transactionManager.runShareTransactionCallbacks();
+        assertEquals(1, participant.staged.size());
+        transactionManager.beginTransaction();
+        registration.reserve().complete();
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = Errors.class, names = {"INVALID_RECORD_STATE", "REQUEST_TIMED_OUT", "PRODUCER_FENCED"})
+    public void testShareAcknowledgementStageErrorPreventsCommit(Errors error) {
+        initializeTransactionManager(Optional.of(transactionalId), true);
+        doInitTransactions();
+        TestShareTransactionParticipant participant = new TestShareTransactionParticipant(transactionManager);
+        ShareTransactionParticipant.Registration registration =
+            transactionManager.registerShareTransactionParticipant(participant, () -> { });
+        transactionManager.beginTransaction();
+        registration.reserve().complete();
+        TransactionalRequestResult commit = transactionManager.beginCommit();
+        transactionManager.runShareTransactionCallbacks();
+
+        participant.stageResult.completeExceptionally(error.exception());
+
+        assertNull(transactionManager.nextRequest(false));
+        assertTrue(commit.isCompleted());
+        assertFalse(commit.isSuccessful());
+        assertThrows(KafkaException.class, () -> transactionManager.maybeAddPartition(tp0));
+        if (error == Errors.PRODUCER_FENCED) {
+            assertTrue(transactionManager.hasFatalError());
+            assertThrows(ProducerFencedException.class, () -> commit.await(0, TimeUnit.MILLISECONDS, TEST_TIMEOUT_MSG));
+            assertTrue(commit.isAcked());
+            assertThrows(ProducerFencedException.class, transactionManager::beginAbort);
+            transactionManager.runShareTransactionCallbacks();
+            assertEquals(List.of(ShareTransactionParticipant.Outcome.UNKNOWN), participant.outcomes);
+        } else {
+            assertTrue(transactionManager.hasAbortableError());
+            assertThrows(KafkaException.class, () -> commit.await(0, TimeUnit.MILLISECONDS, TEST_TIMEOUT_MSG));
+            TransactionalRequestResult abort = transactionManager.beginAbort();
+            completeShareTransactionRequest(TransactionResult.ABORT);
+            abort.await(0, TimeUnit.MILLISECONDS, TEST_TIMEOUT_MSG);
+            transactionManager.runShareTransactionCallbacks();
+            assertEquals(List.of(ShareTransactionParticipant.Outcome.ABORTED), participant.outcomes);
+        }
+    }
+
+    @Test
+    public void testShareAcknowledgementAbortDoesNotStageUnsentCohort() {
+        initializeTransactionManager(Optional.of(transactionalId), true);
+        doInitTransactions();
+        TestShareTransactionParticipant participant = new TestShareTransactionParticipant(transactionManager);
+        ShareTransactionParticipant.Registration registration =
+            transactionManager.registerShareTransactionParticipant(participant, () -> { });
+        transactionManager.beginTransaction();
+        ShareTransactionParticipant.Reservation reservation = registration.reserve();
+        TransactionalRequestResult abort = transactionManager.beginAbort();
+        assertNull(transactionManager.nextRequest(false));
+        assertThrows(IllegalStateException.class, reservation::complete);
+        abort.await(0, TimeUnit.MILLISECONDS, TEST_TIMEOUT_MSG);
+        transactionManager.runShareTransactionCallbacks();
+        assertTrue(participant.staged.isEmpty());
+        assertEquals(List.of(ShareTransactionParticipant.Outcome.ABORTED), participant.outcomes);
+    }
+
+    @Test
+    public void testLateShareAcknowledgementResponseDoesNotCompleteNextTransaction() {
+        initializeTransactionManager(Optional.of(transactionalId), true);
+        doInitTransactions();
+        TestShareTransactionParticipant participant = new TestShareTransactionParticipant(transactionManager);
+        ShareTransactionParticipant.Registration registration =
+            transactionManager.registerShareTransactionParticipant(participant, () -> { });
+        transactionManager.beginTransaction();
+        ShareTransactionParticipant.Reservation first = registration.reserve();
+        first.complete();
+        TransactionalRequestResult commit = transactionManager.beginCommit();
+        transactionManager.runShareTransactionCallbacks();
+        CompletableFuture<Void> firstStage = participant.stageResult;
+        transactionManager.maybeTransitionToErrorState(new KafkaException("Produce failed during acknowledgement staging"));
+        assertNull(transactionManager.nextRequest(false));
+        assertThrows(KafkaException.class, () -> commit.await(0, TimeUnit.MILLISECONDS, TEST_TIMEOUT_MSG));
+        TransactionalRequestResult abort = transactionManager.beginAbort();
+        completeShareTransactionRequest(TransactionResult.ABORT);
+        abort.await(0, TimeUnit.MILLISECONDS, TEST_TIMEOUT_MSG);
+        transactionManager.runShareTransactionCallbacks();
+
+        participant.stageResult = new CompletableFuture<>();
+        transactionManager.beginTransaction();
+        ShareTransactionParticipant.Reservation second = registration.reserve();
+        second.complete();
+        assertNotEquals(first.transaction().sequence(), second.transaction().sequence());
+        TransactionalRequestResult nextCommit = transactionManager.beginCommit();
+        transactionManager.runShareTransactionCallbacks();
+        firstStage.complete(null);
+        assertNull(transactionManager.nextRequest(false));
+        assertFalse(nextCommit.isCompleted());
+        participant.stageResult.complete(null);
+        completeShareTransactionRequest(TransactionResult.COMMIT);
+        nextCommit.await(0, TimeUnit.MILLISECONDS, TEST_TIMEOUT_MSG);
+        transactionManager.runShareTransactionCallbacks();
+        assertEquals(List.of(ShareTransactionParticipant.Outcome.ABORTED, ShareTransactionParticipant.Outcome.COMMITTED), participant.outcomes);
+    }
+
+    @Test
+    public void testShareConsumerBindingAndReservationPreconditions() {
+        doInitTransactions();
+        TestShareTransactionParticipant participant = new TestShareTransactionParticipant(transactionManager);
+        ShareTransactionParticipant.Registration registration =
+            transactionManager.registerShareTransactionParticipant(participant, () -> { });
+        assertSame(registration, transactionManager.registerShareTransactionParticipant(participant, () -> { }));
+        assertThrows(IllegalStateException.class, () -> transactionManager.registerShareTransactionParticipant(
+            new TestShareTransactionParticipant(transactionManager), () -> { }));
+        assertThrows(IllegalStateException.class, registration::reserve);
+        assertThrows(IllegalStateException.class, () -> transactionManager.initializeTransactions(true));
+        transactionManager.beginTransaction();
+        assertThrows(UnsupportedVersionException.class, registration::reserve);
+        assertThrows(IllegalStateException.class, transactionManager::prepareTransaction);
+    }
+
+    @Test
+    public void testShareConsumerClosePreventsUnstagedCommit() {
+        initializeTransactionManager(Optional.of(transactionalId), true);
+        doInitTransactions();
+        TestShareTransactionParticipant participant = new TestShareTransactionParticipant(transactionManager);
+        ShareTransactionParticipant.Registration registration =
+            transactionManager.registerShareTransactionParticipant(participant, () -> { });
+        transactionManager.beginTransaction();
+        registration.reserve().complete();
+        registration.close();
+        assertTrue(transactionManager.hasAbortableError());
+        assertThrows(KafkaException.class, transactionManager::beginCommit);
+        assertThrows(KafkaException.class, registration::reserve);
+        assertTrue(participant.staged.isEmpty());
+    }
+
+    @Test
+    public void testShareConsumerCloseDoesNotWaitForUnpublishedReservation() {
+        initializeTransactionManager(Optional.of(transactionalId), true);
+        doInitTransactions();
+        TestShareTransactionParticipant participant = new TestShareTransactionParticipant(transactionManager);
+        ShareTransactionParticipant.Registration registration =
+            transactionManager.registerShareTransactionParticipant(participant, () -> { });
+        transactionManager.beginTransaction();
+        ShareTransactionParticipant.Reservation reservation = registration.reserve();
+        registration.close();
+        TransactionalRequestResult abort = transactionManager.beginAbort();
+        assertNull(transactionManager.nextRequest(false));
+        abort.await(0, TimeUnit.MILLISECONDS, TEST_TIMEOUT_MSG);
+        assertThrows(IllegalStateException.class, reservation::complete);
+        transactionManager.runShareTransactionCallbacks();
+        assertEquals(List.of(ShareTransactionParticipant.Outcome.ABORTED), participant.outcomes);
+    }
+
+    @Test
+    public void testShareConsumerCannotBindDuringPreparedTransactionRestoration() {
+        initializeTransactionManager(Optional.of(transactionalId), true, true);
+        transactionManager.initializeTransactions(true);
+        assertThrows(IllegalStateException.class, () -> transactionManager.registerShareTransactionParticipant(
+            new TestShareTransactionParticipant(transactionManager), () -> { }));
+    }
+
+    @Test
+    public void testClosedShareConsumerCannotCancelReplacementReservations() {
+        initializeTransactionManager(Optional.of(transactionalId), true);
+        doInitTransactions();
+        ShareTransactionParticipant.Registration previous = transactionManager.registerShareTransactionParticipant(
+            new TestShareTransactionParticipant(transactionManager), () -> { });
+        previous.close();
+        TestShareTransactionParticipant participant = new TestShareTransactionParticipant(transactionManager);
+        ShareTransactionParticipant.Registration current =
+            transactionManager.registerShareTransactionParticipant(participant, () -> { });
+        transactionManager.beginTransaction();
+        ShareTransactionParticipant.Reservation reservation = current.reserve();
+        previous.close();
+        reservation.complete();
+        TransactionalRequestResult commit = transactionManager.beginCommit();
+        transactionManager.runShareTransactionCallbacks();
+        participant.stageResult.complete(null);
+        completeShareTransactionRequest(TransactionResult.COMMIT);
+        commit.await(0, TimeUnit.MILLISECONDS, TEST_TIMEOUT_MSG);
+    }
+
+    @Test
+    public void testShareAcknowledgementPublicationFailurePreventsCommit() {
+        initializeTransactionManager(Optional.of(transactionalId), true);
+        doInitTransactions();
+        TestShareTransactionParticipant participant = new TestShareTransactionParticipant(transactionManager);
+        ShareTransactionParticipant.Registration registration =
+            transactionManager.registerShareTransactionParticipant(participant, () -> { });
+        transactionManager.beginTransaction();
+        registration.reserve().fail(new KafkaException("Could not publish the acknowledgement"));
+        assertTrue(transactionManager.hasAbortableError());
+        assertThrows(KafkaException.class, transactionManager::beginCommit);
+        TransactionalRequestResult abort = transactionManager.beginAbort();
+        assertNull(transactionManager.nextRequest(false));
+        abort.await(0, TimeUnit.MILLISECONDS, TEST_TIMEOUT_MSG);
+        transactionManager.runShareTransactionCallbacks();
+        assertTrue(participant.staged.isEmpty());
+        assertEquals(List.of(ShareTransactionParticipant.Outcome.ABORTED), participant.outcomes);
+    }
+
+    @Test
+    public void testForcedProducerCloseFencesShareReservations() {
+        initializeTransactionManager(Optional.of(transactionalId), true);
+        doInitTransactions();
+        TestShareTransactionParticipant participant = new TestShareTransactionParticipant(transactionManager);
+        ShareTransactionParticipant.Registration registration =
+            transactionManager.registerShareTransactionParticipant(participant, () -> { });
+        transactionManager.beginTransaction();
+        ShareTransactionParticipant.Reservation reservation = registration.reserve();
+        transactionManager.close();
+        assertThrows(IllegalStateException.class, registration::reserve);
+        assertThrows(IllegalStateException.class, reservation::complete);
+        transactionManager.runShareTransactionCallbacks();
+        assertTrue(participant.staged.isEmpty());
+        assertEquals(List.of(ShareTransactionParticipant.Outcome.UNKNOWN), participant.outcomes);
+    }
+
+    private void completeShareTransactionRequest(TransactionResult result) {
+        TransactionManager.TxnRequestHandler handler = transactionManager.nextRequest(false);
+        assertNotNull(handler);
+        assertTrue(handler.isEndTxn());
+        assertEquals(result, ((EndTxnRequest) handler.requestBuilder().build()).result());
+        ProducerIdAndEpoch owner = transactionManager.producerIdAndEpoch();
+        handler.handleResponse(new EndTxnResponse(new EndTxnResponseData().setErrorCode(Errors.NONE.code())
+            .setProducerId(owner.producerId).setProducerEpoch((short) (owner.epoch + 1))));
+    }
+
+    private static final class TestShareTransactionParticipant implements ShareTransactionParticipant {
+        private final TransactionManager manager;
+        private CompletableFuture<Void> stageResult = new CompletableFuture<>();
+        private final List<TransactionContext> staged = new ArrayList<>();
+        private final List<Outcome> outcomes = new ArrayList<>();
+
+        private TestShareTransactionParticipant(TransactionManager manager) {
+            this.manager = manager;
+        }
+
+        @Override
+        public CompletableFuture<Void> stage(TransactionContext transaction) {
+            assertFalse(Thread.holdsLock(manager));
+            staged.add(transaction);
+            return stageResult;
+        }
+
+        @Override
+        public void complete(TransactionContext transaction, Outcome outcome, RuntimeException exception) {
+            assertFalse(Thread.holdsLock(manager));
+            outcomes.add(outcome);
+        }
     }
 
     private void initializeTransactionManager(

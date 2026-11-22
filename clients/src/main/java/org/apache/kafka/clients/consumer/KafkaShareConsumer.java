@@ -22,6 +22,7 @@ import org.apache.kafka.clients.consumer.internals.ShareConsumerDelegateCreator;
 import org.apache.kafka.clients.consumer.internals.ShareConsumerMetadata;
 import org.apache.kafka.clients.consumer.internals.ShareSubscriptionState;
 import org.apache.kafka.clients.consumer.internals.metrics.KafkaShareConsumerMetrics;
+import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.Metric;
 import org.apache.kafka.common.MetricName;
@@ -694,6 +695,11 @@ public class KafkaShareConsumer<K, V> implements ShareConsumer<K, V> {
     @Override
     public void setAcknowledgementCommitCallback(AcknowledgementCommitCallback callback) {
         delegate.setAcknowledgementCommitCallback(callback);
+    }
+
+    @Override
+    public void setTransactionContextProvider(KafkaProducer<?, ?> producer) {
+        delegate.setTransactionContextProvider(producer);
     }
 
     /**

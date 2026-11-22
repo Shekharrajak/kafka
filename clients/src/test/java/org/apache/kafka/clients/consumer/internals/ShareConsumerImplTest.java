@@ -31,6 +31,7 @@ import org.apache.kafka.clients.consumer.internals.events.CompletableEventReaper
 import org.apache.kafka.clients.consumer.internals.events.ErrorEvent;
 import org.apache.kafka.clients.consumer.internals.events.ShareAcknowledgeAsyncEvent;
 import org.apache.kafka.clients.consumer.internals.events.ShareAcknowledgeOnCloseEvent;
+import org.apache.kafka.clients.consumer.internals.events.ShareAcknowledgeTransactionalEvent;
 import org.apache.kafka.clients.consumer.internals.events.ShareAcknowledgementCommitCallbackRegistrationEvent;
 import org.apache.kafka.clients.consumer.internals.events.ShareAcknowledgementEvent;
 import org.apache.kafka.clients.consumer.internals.events.ShareFetchEvent;
@@ -39,6 +40,8 @@ import org.apache.kafka.clients.consumer.internals.events.ShareSubscriptionChang
 import org.apache.kafka.clients.consumer.internals.events.ShareUnsubscribeEvent;
 import org.apache.kafka.clients.consumer.internals.events.StopFindCoordinatorOnCloseEvent;
 import org.apache.kafka.clients.consumer.internals.metrics.AsyncConsumerMetrics;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.internals.ShareTransactionParticipant;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.Metric;
 import org.apache.kafka.common.MetricName;
@@ -411,6 +414,64 @@ public class ShareConsumerImplTest {
         backgroundEventQueue.add(new ErrorEvent(new InvalidTopicException(Set.of("!test-topic"))));
         completeShareUnsubscribeApplicationEventSuccessfully(subscriptions);
         assertDoesNotThrow(() -> consumer.close());
+    }
+
+    @Test
+    public void testTransactionalModeRequiresProviderAndProducerOwnsCommit() {
+        consumer = newConsumer(mock(ShareFetchBuffer.class), new ShareSubscriptionState(new LogContext()), "group-id", "client-id", "transactional");
+        assertThrows(IllegalStateException.class, () -> consumer.poll(Duration.ZERO));
+        assertThrows(IllegalStateException.class, consumer::commitAsync);
+        assertThrows(IllegalStateException.class, consumer::commitSync);
+    }
+
+    @Test
+    public void testTransactionalModeReservesExactRecordAndBlocksNextPollUntilFinalOutcome() {
+        ShareSubscriptionState subscriptions = new ShareSubscriptionState(new LogContext());
+        consumer = newConsumer(mock(ShareFetchBuffer.class), subscriptions, "group-id", "client-id", "transactional");
+        KafkaProducer<?, ?> producer = mock(KafkaProducer.class);
+        ShareTransactionParticipant.Registration registration = mock(ShareTransactionParticipant.Registration.class);
+        ShareTransactionParticipant.Reservation reservation = mock(ShareTransactionParticipant.Reservation.class);
+        ShareTransactionParticipant.TransactionContext transaction = mock(ShareTransactionParticipant.TransactionContext.class);
+        AtomicReference<ShareTransactionParticipant> participant = new AtomicReference<>();
+        doAnswer(invocation -> {
+            participant.set(invocation.getArgument(0));
+            return registration;
+        }).when(producer).registerShareTransactionParticipant(any());
+        doReturn(reservation).when(registration).reserve();
+        doReturn(transaction).when(reservation).transaction();
+        consumer.setTransactionContextProvider(producer);
+        String topic = "transactional-input";
+        TopicIdPartition partition = new TopicIdPartition(Uuid.randomUuid(), 0, topic);
+        ShareInFlightBatch<String, String> batch = new ShareInFlightBatch<>(0, partition, Optional.empty(), Uuid.randomUuid());
+        ConsumerRecord<String, String> record = new ConsumerRecord<>(topic, 0, 0L, "key", "value");
+        batch.addRecord(record, Uuid.randomUuid());
+        ShareFetch<String, String> fetch = ShareFetch.empty();
+        fetch.add(partition, batch);
+        doReturn(fetch).doReturn(ShareFetch.empty()).when(fetchCollector).collect(any(ShareFetchBuffer.class));
+        completeShareSubscriptionChangeApplicationEventSuccessfully(subscriptions, List.of(topic));
+        consumer.subscribe(List.of(topic));
+        assertEquals(1, consumer.poll(Duration.ofMillis(100)).count());
+        assertThrows(IllegalArgumentException.class, () -> consumer.acknowledge(record, AcknowledgeType.RELEASE));
+        assertThrows(IllegalStateException.class, () -> consumer.acknowledge(new ConsumerRecord<>(topic, 0, 0L, "key", "value")));
+        consumer.acknowledge(record);
+        verify(reservation).complete();
+        assertTrue(fetch.takeAcknowledgedRecords().isEmpty());
+        assertThrows(IllegalStateException.class, () -> consumer.poll(Duration.ZERO));
+        CompletableFuture<Void> stage = participant.get().stage(transaction);
+        verify(applicationEventHandler).add(argThat(event -> event instanceof ShareAcknowledgeTransactionalEvent));
+        assertFalse(stage.isDone());
+        assertThrows(IllegalStateException.class, () -> consumer.poll(Duration.ZERO));
+        participant.get().complete(transaction, ShareTransactionParticipant.Outcome.COMMITTED, null);
+        assertFalse(batch.hasTransactionalAcknowledgements());
+        assertDoesNotThrow(() -> consumer.poll(Duration.ZERO));
+    }
+
+    @Test
+    public void testTransactionalModeRejectsBatchOptimizedAcquisition() {
+        Properties properties = requiredConsumerPropertiesAndGroupId("group-id");
+        properties.put(ConsumerConfig.SHARE_ACKNOWLEDGEMENT_MODE_CONFIG, "transactional");
+        properties.put(ConsumerConfig.SHARE_ACQUIRE_MODE_CONFIG, "batch_optimized");
+        assertThrows(KafkaException.class, () -> newConsumer(properties));
     }
 
     @Test

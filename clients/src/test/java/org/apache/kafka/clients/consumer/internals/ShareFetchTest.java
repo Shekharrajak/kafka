@@ -21,6 +21,7 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.errors.UnsupportedVersionException;
 
 import org.junit.jupiter.api.Test;
 
@@ -44,6 +45,61 @@ public class ShareFetchTest {
     private static final String TOPIC = "topic-a";
     private final TopicIdPartition partition0 = new TopicIdPartition(Uuid.randomUuid(), 0, TOPIC);
     private final TopicIdPartition partition1 = new TopicIdPartition(partition0.topicId(), 1, TOPIC);
+
+    @Test
+    public void testTransactionalAcknowledgementKeepsAcquisitionWithoutNormalAck() {
+        Uuid memberId = Uuid.randomUuid();
+        Uuid acquisitionId = Uuid.randomUuid();
+        ShareInFlightBatch<String, String> batch = new ShareInFlightBatch<>(NODE_ID, partition0, Optional.empty(), memberId);
+        ConsumerRecord<String, String> record = new ConsumerRecord<>(TOPIC, 0, 7L, "key", "value");
+        batch.addRecord(record, acquisitionId);
+        batch.addGap(6L);
+        ShareFetch<String, String> fetch = ShareFetch.empty();
+        fetch.add(partition0, batch);
+
+        TransactionalShareAcknowledgement acknowledgement = fetch.transactionalAcknowledgement(record, AcknowledgeType.ACCEPT);
+        fetch.removeTransactionalRecord(record, acknowledgement);
+
+        assertEquals(memberId, acknowledgement.memberId());
+        assertEquals(acquisitionId, acknowledgement.acquisitionId());
+        assertEquals(7L, acknowledgement.offset());
+        assertTrue(fetch.checkAllInFlightAreAcknowledged());
+        assertTrue(batch.hasTransactionalAcknowledgements());
+        Map<TopicIdPartition, NodeAcknowledgements> gaps = fetch.takeGapAcknowledgements();
+        assertEquals(1, gaps.get(partition0).acknowledgements().size());
+        assertNull(gaps.get(partition0).acknowledgements().get(6L));
+        assertTrue(fetch.takeAcknowledgedRecords().isEmpty());
+        acknowledgement.complete();
+        acknowledgement.complete();
+        assertFalse(batch.hasTransactionalAcknowledgements());
+    }
+
+    @Test
+    public void testTransactionalAcknowledgementRequiresExactDeliveredObjectAndAcquisition() {
+        ShareInFlightBatch<String, String> batch = new ShareInFlightBatch<>(NODE_ID, partition0, Optional.empty(), Uuid.randomUuid());
+        ConsumerRecord<String, String> record = new ConsumerRecord<>(TOPIC, 0, 7L, "key", "value");
+        batch.addRecord(record, Uuid.randomUuid());
+        ShareFetch<String, String> fetch = ShareFetch.empty();
+        fetch.add(partition0, batch);
+        assertThrows(IllegalStateException.class, () -> fetch.transactionalAcknowledgement(
+            new ConsumerRecord<>(TOPIC, 0, 7L, "key", "value"), AcknowledgeType.ACCEPT));
+        ShareInFlightBatch<String, String> legacy = new ShareInFlightBatch<>(NODE_ID, partition1, Optional.empty());
+        ConsumerRecord<String, String> legacyRecord = new ConsumerRecord<>(TOPIC, 1, 7L, "key", "value");
+        legacy.addRecord(legacyRecord);
+        fetch.add(partition1, legacy);
+        assertThrows(UnsupportedVersionException.class, () -> fetch.transactionalAcknowledgement(legacyRecord, AcknowledgeType.ACCEPT));
+        assertEquals(2, fetch.numRecords());
+    }
+
+    @Test
+    public void testTransactionalDrainRejectsInternallyGeneratedTerminalAcknowledgements() {
+        ShareFetch<String, String> fetch = ShareFetch.empty();
+        ShareInFlightBatch<String, String> batch = batchWithRecords(partition0, 0L, 1);
+        fetch.add(partition0, batch);
+        batch.addAcknowledgement(0L, AcknowledgeType.RELEASE);
+        assertThrows(IllegalStateException.class, fetch::takeGapAcknowledgements);
+        assertEquals(AcknowledgeType.RELEASE, batch.getAcknowledgements().get(0L));
+    }
 
     @Test
     public void testEmptyFetch() {

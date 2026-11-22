@@ -38,6 +38,7 @@ public class ShareFetchConfig {
     public final String clientRackId;
     public final IsolationLevel isolationLevel;
     public final ShareAcquireMode shareAcquireMode;
+    public final boolean transactionalAcknowledgements;
 
     /**
      * Constructs a new {@link ShareFetchConfig} using explicitly provided values. This is provided here for tests that
@@ -62,6 +63,7 @@ public class ShareFetchConfig {
         this.clientRackId = clientRackId;
         this.isolationLevel = isolationLevel;
         this.shareAcquireMode = shareAcquireMode;
+        this.transactionalAcknowledgements = false;
     }
 
     /**
@@ -92,6 +94,8 @@ public class ShareFetchConfig {
         this.clientRackId = config.getString(ConsumerConfig.CLIENT_RACK_CONFIG);
         this.isolationLevel = configuredIsolationLevel(config);
         this.shareAcquireMode = ShareAcquireMode.of(config.getString(ConsumerConfig.SHARE_ACQUIRE_MODE_CONFIG));
+        this.transactionalAcknowledgements = ShareAcknowledgementMode.TRANSACTIONAL.equals(
+            ShareAcknowledgementMode.fromString(config.getString(ConsumerConfig.SHARE_ACKNOWLEDGEMENT_MODE_CONFIG)));
     }
 
     @Override

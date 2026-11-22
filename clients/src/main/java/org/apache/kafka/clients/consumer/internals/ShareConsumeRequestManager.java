@@ -22,6 +22,7 @@ import org.apache.kafka.clients.consumer.internals.NetworkClientDelegate.PollRes
 import org.apache.kafka.clients.consumer.internals.NetworkClientDelegate.UnsentRequest;
 import org.apache.kafka.clients.consumer.internals.events.ShareAcknowledgementEvent;
 import org.apache.kafka.clients.consumer.internals.events.ShareAcknowledgementEventHandler;
+import org.apache.kafka.clients.producer.internals.ShareTransactionParticipant.TransactionContext;
 import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.Node;
@@ -30,6 +31,7 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.errors.InvalidRecordStateException;
 import org.apache.kafka.common.errors.RetriableException;
+import org.apache.kafka.common.errors.TimeoutException;
 import org.apache.kafka.common.internals.IdempotentCloser;
 import org.apache.kafka.common.message.ShareAcknowledgeRequestData;
 import org.apache.kafka.common.message.ShareAcknowledgeResponseData;
@@ -98,6 +100,7 @@ public class ShareConsumeRequestManager implements RequestManager, MemberStateLi
     private final ShareFetchMetricsManager metricsManager;
     private final IdempotentCloser idempotentCloser = new IdempotentCloser();
     private Uuid memberId;
+    private final List<TransactionalAcknowledgeRequest> transactionalAcknowledgements = new ArrayList<>();
     private boolean fetchMoreRecords = false;
     private final AtomicInteger fetchRecordsNodeId = new AtomicInteger(-1);
     private final Map<TopicPartition, TopicIdPartition> shareSessionTopicIdMap;
@@ -148,6 +151,10 @@ public class ShareConsumeRequestManager implements RequestManager, MemberStateLi
 
     @Override
     public PollResult poll(long currentTimeMs) {
+        PollResult transactionalResult = processTransactionalAcknowledgements(currentTimeMs);
+        if (transactionalResult != null) {
+            return transactionalResult;
+        }
         if (memberId == null) {
             if (closing && !closeFuture.isDone()) {
                 closeFuture.complete(null);
@@ -419,6 +426,9 @@ public class ShareConsumeRequestManager implements RequestManager, MemberStateLi
      * in flight, or being processed as part of an acknowledge request state.
      */
     private boolean nodeHasPendingAcknowledgements(int nodeId) {
+        if (transactionalAcknowledgements.stream().anyMatch(request -> request.nodeId == nodeId && !request.future.isDone())) {
+            return true;
+        }
         Map<TopicIdPartition, Acknowledgements> acksToSend = fetchAcknowledgementsToSend.get(nodeId);
         if (acksToSend != null && !acksToSend.isEmpty()) {
             return true;
@@ -1049,7 +1059,8 @@ public class ShareConsumeRequestManager implements RequestManager, MemberStateLi
                         partitionData,
                         responseAcquisitionLockTimeoutMs,
                         shareFetchMetricsAggregator,
-                        requestVersion)
+                        requestVersion,
+                        Uuid.fromString(requestData.memberId()))
                 );
 
                 if (!partitionData.acquiredRecords().isEmpty()) {
@@ -1419,7 +1430,109 @@ public class ShareConsumeRequestManager implements RequestManager, MemberStateLi
         return !shareFetchBuffer.isEmpty();
     }
 
+    public CompletableFuture<Void> acknowledgeTransactional(TransactionContext transaction,
+                                                            List<TransactionalShareAcknowledgement> acknowledgements,
+                                                            long deadlineMs) {
+        if (closing || memberId == null || acknowledgements.isEmpty()) {
+            return failedTransactionalAcknowledgement(new IllegalStateException("No active share session is available for transactional acknowledgements"));
+        }
+        Map<Integer, List<TransactionalShareAcknowledgement>> byNode = new LinkedHashMap<>();
+        for (TransactionalShareAcknowledgement acknowledgement : acknowledgements) {
+            if (!memberId.equals(acknowledgement.memberId())) {
+                return failedTransactionalAcknowledgement(new IllegalStateException("The acknowledged acquisition belongs to a different share group member"));
+            }
+            byNode.computeIfAbsent(acknowledgement.nodeId(), ignored -> new ArrayList<>()).add(acknowledgement);
+        }
+        List<CompletableFuture<Void>> results = new ArrayList<>();
+        byNode.forEach((nodeId, entries) -> {
+            TransactionalAcknowledgeRequest request = new TransactionalAcknowledgeRequest(nodeId, transaction, entries, deadlineMs);
+            transactionalAcknowledgements.add(request);
+            results.add(request.future);
+        });
+        return CompletableFuture.allOf(results.toArray(new CompletableFuture<?>[0]));
+    }
+
+    private CompletableFuture<Void> failedTransactionalAcknowledgement(RuntimeException exception) {
+        CompletableFuture<Void> failure = new CompletableFuture<>();
+        failure.completeExceptionally(exception);
+        return failure;
+    }
+
+    private PollResult processTransactionalAcknowledgements(long currentTimeMs) {
+        List<UnsentRequest> requests = new ArrayList<>();
+        Iterator<TransactionalAcknowledgeRequest> iterator = transactionalAcknowledgements.iterator();
+        while (iterator.hasNext()) {
+            TransactionalAcknowledgeRequest request = iterator.next();
+            if (currentTimeMs >= request.deadlineMs) {
+                request.future.completeExceptionally(new TimeoutException("Timed out staging transactional share acknowledgements"));
+            }
+            if (request.future.isDone()) {
+                iterator.remove();
+            } else if (!request.sent && !nodesWithPendingRequests.contains(request.nodeId)) {
+                try {
+                    requests.add(buildTransactionalAcknowledgement(request));
+                } catch (RuntimeException e) {
+                    request.future.completeExceptionally(e);
+                }
+            }
+        }
+        return requests.isEmpty() ? null : new PollResult(requests);
+    }
+
+    private UnsentRequest buildTransactionalAcknowledgement(TransactionalAcknowledgeRequest request) {
+        ShareSessionHandler session = sessionHandlers.get(request.nodeId);
+        Node node = metadata.fetch().nodeById(request.nodeId);
+        if (session == null || node == null || !request.acknowledgements.get(0).memberId().equals(memberId)) {
+            throw new KafkaException("The acquired share session is no longer available for transactional acknowledgements");
+        }
+        UnsentRequest unsentRequest = new UnsentRequest(TransactionalShareAcknowledgements.buildRequest(
+            request.transaction, groupId, memberId, session, metadata.topicIds(), request.acknowledgements), Optional.of(node));
+        request.sent = true;
+        nodesWithPendingRequests.add(request.nodeId);
+        return unsentRequest.whenComplete((response, error) -> handleTransactionalAcknowledgementResponse(request, session, response, error));
+    }
+
+    private void handleTransactionalAcknowledgementResponse(TransactionalAcknowledgeRequest request,
+                                                           ShareSessionHandler session,
+                                                           ClientResponse clientResponse,
+                                                           Throwable error) {
+        nodesWithPendingRequests.remove(request.nodeId);
+        if (error != null) {
+            session.handleError(error);
+            request.future.completeExceptionally(error);
+            return;
+        }
+        try {
+            TransactionalShareAcknowledgements.handleResponse(session, clientResponse, request.acknowledgements);
+            request.future.complete(null);
+        } catch (RuntimeException e) {
+            request.future.completeExceptionally(e);
+        }
+    }
+
+    private void failTransactionalAcknowledgements(RuntimeException error) {
+        transactionalAcknowledgements.forEach(request -> request.future.completeExceptionally(error));
+    }
+
+    private static final class TransactionalAcknowledgeRequest {
+        private final int nodeId;
+        private final TransactionContext transaction;
+        private final List<TransactionalShareAcknowledgement> acknowledgements;
+        private final long deadlineMs;
+        private final CompletableFuture<Void> future = new CompletableFuture<>();
+        private boolean sent;
+
+        private TransactionalAcknowledgeRequest(int nodeId, TransactionContext transaction,
+                                              List<TransactionalShareAcknowledgement> acknowledgements, long deadlineMs) {
+            this.nodeId = nodeId;
+            this.transaction = transaction;
+            this.acknowledgements = List.copyOf(acknowledgements);
+            this.deadlineMs = deadlineMs;
+        }
+    }
+
     protected void closeInternal() {
+        failTransactionalAcknowledgements(new KafkaException("Share consumer closed before acknowledgement staging completed"));
         Utils.closeQuietly(shareFetchBuffer, "shareFetchBuffer");
         Utils.closeQuietly(metricsManager, "shareFetchMetricsManager");
     }
@@ -1430,7 +1543,11 @@ public class ShareConsumeRequestManager implements RequestManager, MemberStateLi
 
     @Override
     public void onMemberEpochUpdated(Optional<Integer> memberEpochOpt, String memberId) {
-        this.memberId = Uuid.fromString(memberId);
+        Uuid updatedMemberId = Uuid.fromString(memberId);
+        if (this.memberId != null && !this.memberId.equals(updatedMemberId)) {
+            failTransactionalAcknowledgements(new KafkaException("Share group membership changed before acknowledgement staging completed"));
+        }
+        this.memberId = updatedMemberId;
     }
 
     /**

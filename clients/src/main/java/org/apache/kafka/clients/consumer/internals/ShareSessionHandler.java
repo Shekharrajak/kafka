@@ -29,6 +29,7 @@ import org.apache.kafka.common.requests.ShareAcknowledgeResponse;
 import org.apache.kafka.common.requests.ShareFetchRequest;
 import org.apache.kafka.common.requests.ShareFetchResponse;
 import org.apache.kafka.common.requests.ShareRequestMetadata;
+import org.apache.kafka.common.requests.TxnShareAcknowledgeResponse;
 import org.apache.kafka.common.utils.internals.LogContext;
 
 import org.slf4j.Logger;
@@ -215,25 +216,45 @@ public class ShareSessionHandler {
             // If the request has renew acknowledgements, the ShareFetch is only used to send the acknowledgements
             // and potentially update the share session. The parameters for wait time, number of bytes and number of
             // records are all zero.
-            return ShareFetchRequest.Builder.forConsumer(
+            return transactionalFetchBuilder(shareFetchConfig, ShareFetchRequest.Builder.forConsumer(
                 groupId, nextMetadata, 0,
                 0, 0, 0,
                 0, shareFetchConfig.shareAcquireMode.id, true,
-                added, removed, acknowledgementBatches);
+                added, removed, acknowledgementBatches));
         } else if (canSkipIfRequestEmpty) {
             // The request contains changes to the share session or acknowledgements only. The parameters for wait time,
             // number of bytes and number of records are all zero.
-            return ShareFetchRequest.Builder.forConsumer(
+            return transactionalFetchBuilder(shareFetchConfig, ShareFetchRequest.Builder.forConsumer(
                 groupId, nextMetadata, 0,
                 0, 0, 0,
                 0, shareFetchConfig.shareAcquireMode.id, false,
-                added, removed, acknowledgementBatches);
+                added, removed, acknowledgementBatches));
         } else {
-            return ShareFetchRequest.Builder.forConsumer(
+            return transactionalFetchBuilder(shareFetchConfig, ShareFetchRequest.Builder.forConsumer(
                 groupId, nextMetadata, shareFetchConfig.maxWaitMs,
                 shareFetchConfig.minBytes, shareFetchConfig.maxBytes, shareFetchConfig.maxPollRecords,
                 shareFetchConfig.maxPollRecords, shareFetchConfig.shareAcquireMode.id, false,
-                added, removed, acknowledgementBatches);
+                added, removed, acknowledgementBatches));
+        }
+    }
+
+    private ShareFetchRequest.Builder transactionalFetchBuilder(ShareFetchConfig config, ShareFetchRequest.Builder builder) {
+        return config.transactionalAcknowledgements ? new ShareFetchRequest.Builder(builder.data(), (short) 3, (short) 3) : builder;
+    }
+
+    public ShareRequestMetadata transactionalAcknowledgementMetadata() {
+        if (nextMetadata.isNewSession() || nextMetadata.isFinalEpoch()) {
+            throw new IllegalStateException("Transactional acknowledgements require an established share session");
+        }
+        return nextMetadata;
+    }
+
+    public void handleResponse(TxnShareAcknowledgeResponse response) {
+        Errors error = Errors.forCode(response.data().errorCode());
+        if (error == Errors.SHARE_SESSION_NOT_FOUND || error == Errors.INVALID_SHARE_SESSION_EPOCH) {
+            nextMetadata = nextMetadata.nextCloseExistingAttemptNew();
+        } else {
+            nextMetadata = nextMetadata.nextEpoch();
         }
     }
 

@@ -28,6 +28,7 @@ import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.requests.ShareFetchRequest;
 import org.apache.kafka.common.requests.ShareFetchResponse;
+import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.utils.internals.LogContext;
 
 import org.junit.jupiter.api.Test;
@@ -79,6 +80,26 @@ public class ShareSessionHandlerTest {
             ConsumerConfig.DEFAULT_CLIENT_RACK,
             IsolationLevel.READ_UNCOMMITTED,
             ShareAcquireMode.RECORD_LIMIT);
+
+    @Test
+    public void testTransactionalAcknowledgementsRequireAcquisitionIdentityProtocol() {
+        ConsumerConfig consumerConfig = new ConsumerConfig(Map.of(
+            ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092",
+            ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
+            ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
+            ConsumerConfig.SHARE_ACKNOWLEDGEMENT_MODE_CONFIG, "transactional",
+            ConsumerConfig.SHARE_ACQUIRE_MODE_CONFIG, "record_limit")) {
+            @Override
+            protected void checkUnsupportedConfigsPostProcess() {
+            }
+        };
+        ShareFetchConfig config = new ShareFetchConfig(consumerConfig);
+        ShareSessionHandler handler = new ShareSessionHandler(LOG_CONTEXT, 0, Uuid.randomUuid());
+        handler.addPartitionToFetch(new TopicIdPartition(Uuid.randomUuid(), 0, "topic"), null);
+        ShareFetchRequest.Builder builder = handler.newShareFetchBuilder("group", config, false);
+        assertEquals(3, builder.oldestAllowedVersion());
+        assertEquals(3, builder.latestAllowedVersion());
+    }
 
     private static Stream<ShareFetchConfig> shareFetchConfigProvider() {
         return Stream.of(DEFAULT_SHARE_FETCH_CONFIG, SHARE_FETCH_CONFIG_RECORD_LIMIT);
