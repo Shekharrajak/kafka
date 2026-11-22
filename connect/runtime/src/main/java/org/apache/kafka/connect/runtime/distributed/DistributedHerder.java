@@ -557,6 +557,11 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
             }
         }
 
+        if (fenceIdleTransactionalShareSinks()) {
+            long fencingRetry = time.milliseconds() + RECONFIGURE_CONNECTOR_TASKS_BACKOFF_INITIAL_MS;
+            scheduledTick = scheduledTick == null ? fencingRetry : Math.min(scheduledTick, fencingRetry);
+        }
+
         // Let the group take any actions it needs to
         try {
             long nextRequestTimeoutMs = scheduledTick != null ? Math.max(scheduledTick - time.milliseconds(), 0L) : Long.MAX_VALUE;
@@ -929,6 +934,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
                 if (!configState.contains(connName)) {
                     callback.onCompletion(new NotFoundException("Connector " + connName + " not found"), null);
                 } else {
+                    requireTransactionalShareSinkStoppedAndFenced(connName);
                     log.trace("Removing connector config {} {}", connName, configState.connectors());
                     writeToConfigTopicAsLeader(
                             "removing the config for connector " + connName + " from the config topic",
@@ -946,6 +952,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
     protected Map<String, ConfigValue> validateSinkConnectorConfig(SinkConnector connector, ConfigDef configDef, Map<String, String> config) {
         Map<String, ConfigValue> result = super.validateSinkConnectorConfig(connector, configDef, config);
         validateSinkConnectorGroupId(config, result);
+        validateTransactionalShareSink(config, result);
         return result;
     }
 
@@ -977,6 +984,21 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
                 validatedName.addErrorMessage("Consumer group for sink connector named " + name +
                         " conflicts with Connect worker group " + workerGroupId);
             }
+        }
+    }
+
+    private void validateTransactionalShareSink(Map<String, String> rawConfig, Map<String, ConfigValue> validatedConfig) {
+        if (!SinkConnectorConfig.isTransactionalShareSink(rawConfig)) return;
+        if (!config.exactlyOnceSourceEnabled()) {
+            String key = SinkConnectorConfig.SHARE_DELIVERY_GUARANTEE_CONFIG;
+            validatedConfig.computeIfAbsent(key, ignored -> new ConfigValue(key, rawConfig.get(key), List.of(), new ArrayList<>()))
+                .addErrorMessage("Transactional share sinks require exactly.once.source.support=enabled for config-topic fencing.");
+        }
+        String groupKey = SinkConnectorConfig.SHARE_GROUP_ID_CONFIG;
+        String shareGroup = rawConfig.get(groupKey);
+        if (workerGroupId.equals(shareGroup)) {
+            validatedConfig.computeIfAbsent(groupKey, ignored -> new ConfigValue(groupKey, shareGroup, List.of(), new ArrayList<>()))
+                .addErrorMessage("Share group conflicts with the Connect worker group.");
         }
     }
 
@@ -1251,6 +1273,10 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
      */
     private void writeConnectorConfigAndComplete(String connName, Map<String, String> config, TargetState targetState,
                                                  String offsetsStatus, Callback<Created<ConnectorInfo>> callback) {
+        if (transactionalShareSinkIdentityChanged(connName, config)) {
+            if (!refreshConfigSnapshot(workerSyncTimeoutMs)) throw new ConnectException("Failed to refresh config before changing transactional share-sink identity");
+            if (transactionalShareSinkIdentityChanged(connName, config)) requireTransactionalShareSinkStoppedAndFenced(connName);
+        }
         // Must be read before the write, which may update the snapshot and make every connector look pre-existing
         boolean exists = configState.contains(connName);
 
@@ -1439,17 +1465,20 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
 
         // We don't have to check for a pending rebalance here
 
-        if (!isLeader())
+        if (!isLeader()) {
             callback.onCompletion(new NotLeaderException("Only the leader may perform zombie fencing.", leaderUrl()), null);
-        else if (!configState.contains(connName))
+            return;
+        }
+        if (!refreshConfigSnapshot(workerSyncTimeoutMs)) {
+            throw new ConnectException("Failed to read to end of config topic before performing zombie fencing");
+        }
+        if (!configState.contains(connName))
             callback.onCompletion(new NotFoundException("Connector " + connName + " not found"), null);
-        else if (!isSourceConnector(connName))
+        else if (!isSourceConnector(connName) && !isTransactionalShareSink(connName))
             callback.onCompletion(new BadRequestException("Connector " + connName + " is not a source connector"), null);
+        else if (isTransactionalShareSink(connName) && !config.exactlyOnceSourceEnabled())
+            callback.onCompletion(new BadRequestException("Transactional share sinks require exactly.once.source.support=enabled for config-topic fencing"), null);
         else {
-            if (!refreshConfigSnapshot(workerSyncTimeoutMs)) {
-                throw new ConnectException("Failed to read to end of config topic before performing zombie fencing");
-            }
-
             int taskCount = configState.taskCount(connName);
             Integer taskCountRecord = configState.taskCountRecord(connName);
 
@@ -1472,7 +1501,14 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
             }
             if (zombieFencing != null) {
                 if (newFencing) {
-                    zombieFencing.start();
+                    try {
+                        zombieFencing.start();
+                    } catch (RuntimeException | Error error) {
+                        synchronized (this) {
+                            activeZombieFencings.remove(connName, zombieFencing);
+                        }
+                        throw error;
+                    }
                 }
                 zombieFencing.addCallback(callback);
                 return;
@@ -1792,6 +1828,11 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
             return false;
         }
 
+        if (isTransactionalShareSink(connName)) {
+            callback.onCompletion(new BadRequestException("Classic consumer offsets cannot modify transactional share-group progress"), null);
+            return false;
+        }
+
         // If the target state for the connector is stopped, its task count is 0, and there is no rebalance pending (checked above),
         // we can be sure that the tasks have at least been attempted to be stopped (or cancelled if they took too long to stop).
         // Zombie tasks are handled by a round of zombie fencing for exactly once source connectors. Zombie sink tasks are handled
@@ -2098,6 +2139,16 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
         Map<String, String> connProps = configState.connectorConfig(taskId.connector());
         switch (connectorType(connProps)) {
             case SINK:
+                if (SinkConnectorConfig.isTransactionalShareSink(connProps)) {
+                    if (!config.exactlyOnceSourceEnabled()) {
+                        throw new ConnectException("Transactional share sinks require exactly.once.source.support=enabled for config-topic fencing");
+                    }
+                    int taskGeneration = configState.taskConfigGeneration(taskId.connector());
+                    return worker.startTransactionalShareSinkTask(
+                        taskId, configState, connProps, configState.taskConfig(taskId), this,
+                        configState.targetState(taskId.connector()), () -> fenceTaskBeforeProducerInitialization(taskId),
+                        () -> verifyTaskGenerationAndOwnership(taskId, taskGeneration));
+                }
                 return worker.startSinkTask(
                         taskId,
                         configState,
@@ -2116,18 +2167,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
                             configState.taskConfig(taskId),
                             this,
                             configState.targetState(taskId.connector()),
-                            () -> {
-                                FutureCallback<Void> preflightFencing = new FutureCallback<>();
-                                fenceZombieSourceTasks(taskId, preflightFencing);
-                                try {
-                                    preflightFencing.get();
-                                } catch (InterruptedException e) {
-                                    throw new ConnectException("Interrupted while attempting to perform round of zombie fencing", e);
-                                } catch (ExecutionException e) {
-                                    Throwable cause = e.getCause();
-                                    throw ConnectUtils.maybeWrap(cause, "Failed to perform round of zombie fencing");
-                                }
-                            },
+                            () -> fenceTaskBeforeProducerInitialization(taskId),
                             () -> verifyTaskGenerationAndOwnership(taskId, taskGeneration)
                     );
                 } else {
@@ -2142,6 +2182,18 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
                 }
             default:
                 throw new ConnectException("Failed to start task " + taskId + " since it is not a recognizable type (source or sink)");
+        }
+    }
+
+    private void fenceTaskBeforeProducerInitialization(ConnectorTaskId taskId) {
+        FutureCallback<Void> preflightFencing = new FutureCallback<>();
+        fenceZombieSourceTasks(taskId, preflightFencing);
+        try {
+            preflightFencing.get();
+        } catch (InterruptedException e) {
+            throw new ConnectException("Interrupted while attempting to perform round of zombie fencing", e);
+        } catch (ExecutionException e) {
+            throw ConnectUtils.maybeWrap(e.getCause(), "Failed to perform round of zombie fencing");
         }
     }
 
@@ -2853,6 +2905,64 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
                         .forEach(DistributedHerder.this::resetConnectorActiveTopics);
             }
         }
+    }
+
+    private boolean isTransactionalShareSink(String connName) {
+        return isTransactionalShareSink(configState.connectorConfig(connName));
+    }
+
+    private boolean isTransactionalShareSink(Map<String, String> connectorConfig) {
+        return connectorConfig != null && SinkConnectorConfig.isTransactionalShareSink(connectorConfig)
+            && ConnectorType.SINK.equals(connectorType(connectorConfig));
+    }
+
+    private boolean transactionalShareSinkIdentityChanged(String connName, Map<String, String> updated) {
+        if (!isTransactionalShareSink(connName)) return false;
+        Map<String, String> previous = configState.connectorConfig(connName);
+        if (!isTransactionalShareSink(updated)) return true;
+        if (!Objects.equals(previous.get(SinkConnectorConfig.SHARE_GROUP_ID_CONFIG), updated.get(SinkConnectorConfig.SHARE_GROUP_ID_CONFIG))) return true;
+        for (String prefix : List.of(ConnectorConfig.CONNECTOR_CLIENT_CONSUMER_OVERRIDES_PREFIX,
+                ConnectorConfig.CONNECTOR_CLIENT_PRODUCER_OVERRIDES_PREFIX, ConnectorConfig.CONNECTOR_CLIENT_ADMIN_OVERRIDES_PREFIX)) {
+            String key = prefix + "bootstrap.servers";
+            if (!bootstrapServers(previous.get(key)).equals(bootstrapServers(updated.get(key)))) return true;
+        }
+        return false;
+    }
+
+    private static Set<String> bootstrapServers(String bootstrap) {
+        return bootstrap == null ? Set.of() : List.of(bootstrap.split(",")).stream().map(String::trim).collect(Collectors.toSet());
+    }
+
+    private void requireTransactionalShareSinkStoppedAndFenced(String connName) {
+        if (!isTransactionalShareSink(connName)) return;
+        Integer recordedCount = configState.taskCountRecord(connName);
+        boolean noUnfencedTasks = recordedCount == null || recordedCount == 0;
+        if (configState.targetState(connName) != TargetState.STOPPED || configState.taskCount(connName) != 0 ||
+                !noUnfencedTasks || configState.pendingFencing(connName)) {
+            throw new BadRequestException("Stop transactional share sink " + connName + " and wait for zombie fencing before deleting it or changing its delivery mode, share group, or data-cluster overrides");
+        }
+    }
+
+    boolean fenceIdleTransactionalShareSinks() {
+        if (!config.exactlyOnceSourceEnabled() || !isLeader()) return false;
+        boolean pending = false;
+        for (String connector : configState.connectors()) {
+            if (configState.taskCount(connector) != 0 || !configState.pendingFencing(connector) || !isTransactionalShareSink(connector)) continue;
+            pending = true;
+            boolean active;
+            synchronized (this) {
+                active = activeZombieFencings.containsKey(connector);
+            }
+            if (active) continue;
+            try {
+                doFenceZombieSourceTasks(connector, (error, ignored) -> {
+                    if (error != null) log.warn("Failed to fence idle transactional share sink {}", connector, error);
+                });
+            } catch (RuntimeException error) {
+                log.warn("Failed to initiate fencing for idle transactional share sink {}", connector, error);
+            }
+        }
+        return pending;
     }
 
     private boolean isSourceConnector(String connName) {

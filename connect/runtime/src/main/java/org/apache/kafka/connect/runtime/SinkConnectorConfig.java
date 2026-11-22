@@ -25,6 +25,7 @@ import org.apache.kafka.common.utils.Utils;
 import org.apache.kafka.connect.runtime.isolation.Plugins;
 import org.apache.kafka.connect.sink.SinkTask;
 import org.apache.kafka.connect.transforms.util.RegexValidator;
+import org.apache.kafka.connect.util.SinkUtils;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -38,6 +39,11 @@ import java.util.stream.Collectors;
  */
 
 public class SinkConnectorConfig extends ConnectorConfig {
+
+    public static final String CONSUMER_TYPE_CONFIG = "consumer.type";
+    public static final String SHARE_GROUP_ID_CONFIG = "share.group.id";
+    public static final String SHARE_DELIVERY_GUARANTEE_CONFIG = "share.delivery.guarantee";
+    public static final String TRANSACTIONAL_SHARE_DELIVERY_GUARANTEE = "exactly_once";
 
     public static final String TOPICS_CONFIG = SinkTask.TOPICS_CONFIG;
     private static final String TOPICS_DOC = "List of topics to consume, separated by commas";
@@ -74,6 +80,12 @@ public class SinkConnectorConfig extends ConnectorConfig {
 
     private static ConfigDef configDef(ConfigDef baseConfigs) {
         return baseConfigs
+                .define(CONSUMER_TYPE_CONFIG, Type.STRING, "classic", ConfigDef.ValidString.in("classic", "share"), Importance.HIGH,
+                        "The Kafka consumer type used by the sink task.")
+                .define(SHARE_GROUP_ID_CONFIG, Type.STRING, "", Importance.HIGH,
+                        "Dedicated share group ID for transactional share sink tasks.")
+                .define(SHARE_DELIVERY_GUARANTEE_CONFIG, Type.STRING, "at_least_once", ConfigDef.ValidString.in("at_least_once", TRANSACTIONAL_SHARE_DELIVERY_GUARANTEE), Importance.HIGH,
+                        "Delivery guarantee for share sink tasks. This experimental implementation requires exactly_once.")
                 .define(TOPICS_CONFIG, ConfigDef.Type.LIST, TOPICS_DEFAULT, ConfigDef.ValidList.anyNonDuplicateValues(true, false), ConfigDef.Importance.HIGH, TOPICS_DOC, COMMON_GROUP, 4, ConfigDef.Width.LONG, TOPICS_DISPLAY)
                 .define(TOPICS_REGEX_CONFIG, ConfigDef.Type.STRING, TOPICS_REGEX_DEFAULT, new RegexValidator(), ConfigDef.Importance.HIGH, TOPICS_REGEX_DOC, COMMON_GROUP, 4, ConfigDef.Width.LONG, TOPICS_REGEX_DISPLAY)
                 .define(DLQ_TOPIC_NAME_CONFIG, ConfigDef.Type.STRING, DLQ_TOPIC_DEFAULT, Importance.MEDIUM, DLQ_TOPIC_NAME_DOC, ERROR_GROUP, 6, ConfigDef.Width.MEDIUM, DLQ_TOPIC_DISPLAY)
@@ -95,6 +107,9 @@ public class SinkConnectorConfig extends ConnectorConfig {
 
     public SinkConnectorConfig(Plugins plugins, Map<String, String> props) {
         super(plugins, configDef(), props);
+        Map<String, ConfigValue> errors = new LinkedHashMap<>();
+        validateShareSettings(props, errors);
+        throwFirstError(errors);
     }
 
     /**
@@ -104,6 +119,10 @@ public class SinkConnectorConfig extends ConnectorConfig {
     public static void validate(Map<String, String> props) {
         Map<String, ConfigValue> validatedConfig = new LinkedHashMap<>();
         validate(props, validatedConfig);
+        throwFirstError(validatedConfig);
+    }
+
+    private static void throwFirstError(Map<String, ConfigValue> validatedConfig) {
         validatedConfig.values().stream()
                 .filter(configValue -> !configValue.errorMessages().isEmpty())
                 .findFirst()
@@ -122,6 +141,7 @@ public class SinkConnectorConfig extends ConnectorConfig {
      *                        entry if one for the problematic property does not already exist.
      */
     public static void validate(Map<String, String> props, Map<String, ConfigValue> validatedConfig) {
+        validateShareSettings(props, validatedConfig);
         final String topicsList = props.get(TOPICS_CONFIG);
         final String topicsRegex = props.get(TOPICS_REGEX_CONFIG);
         final String dlqTopic = props.getOrDefault(DLQ_TOPIC_NAME_CONFIG, "").trim();
@@ -162,6 +182,39 @@ public class SinkConnectorConfig extends ConnectorConfig {
                     addErrorMessage(validatedConfig, TOPICS_REGEX_CONFIG, topicsRegex, errorMessage);
                 }
             }
+        }
+    }
+
+    public static boolean isTransactionalShareSink(Map<String, String> props) {
+        return "share".equals(props.get(CONSUMER_TYPE_CONFIG))
+            && TRANSACTIONAL_SHARE_DELIVERY_GUARANTEE.equals(props.get(SHARE_DELIVERY_GUARANTEE_CONFIG));
+    }
+
+    private static void validateShareSettings(Map<String, String> props, Map<String, ConfigValue> errors) {
+        boolean share = "share".equals(props.get(CONSUMER_TYPE_CONFIG));
+        boolean transactional = TRANSACTIONAL_SHARE_DELIVERY_GUARANTEE.equals(props.get(SHARE_DELIVERY_GUARANTEE_CONFIG));
+        if (share != transactional) {
+            addErrorMessage(errors, SHARE_DELIVERY_GUARANTEE_CONFIG, props.get(SHARE_DELIVERY_GUARANTEE_CONFIG),
+                "This implementation requires consumer.type=share together with share.delivery.guarantee=exactly_once");
+        }
+        if (!share) {
+            return;
+        }
+        String shareGroup = props.get(SHARE_GROUP_ID_CONFIG);
+        if (Utils.isBlank(shareGroup) || !shareGroup.equals(shareGroup.trim())
+            || shareGroup.equals(SinkUtils.consumerGroupId(props.get(NAME_CONFIG)))) {
+            addErrorMessage(errors, SHARE_GROUP_ID_CONFIG, shareGroup, "A dedicated non-blank share.group.id is required");
+        }
+        if (!Utils.isBlank(props.get(TOPICS_REGEX_CONFIG)) || !hasTopicsConfig(props)) {
+            addErrorMessage(errors, TOPICS_CONFIG, props.get(TOPICS_CONFIG), "Transactional share sinks require an explicit topic list");
+        }
+        if (!"none".equals(props.getOrDefault(ERRORS_TOLERANCE_CONFIG, "none"))) {
+            addErrorMessage(errors, ERRORS_TOLERANCE_CONFIG, props.get(ERRORS_TOLERANCE_CONFIG),
+                "Transactional share sinks require errors.tolerance=none");
+        }
+        if (hasDlqTopicConfig(props)) {
+            addErrorMessage(errors, DLQ_TOPIC_NAME_CONFIG, props.get(DLQ_TOPIC_NAME_CONFIG),
+                "Transactional share sinks do not support an independent dead letter queue");
         }
     }
 

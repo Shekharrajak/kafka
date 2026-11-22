@@ -29,6 +29,7 @@ import org.apache.kafka.clients.admin.ListConsumerGroupOffsetsResult;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.consumer.KafkaShareConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.Producer;
@@ -78,6 +79,7 @@ import org.apache.kafka.connect.runtime.rest.entities.Message;
 import org.apache.kafka.connect.sink.SinkConnector;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTask;
+import org.apache.kafka.connect.sink.TransactionalShareSinkTask;
 import org.apache.kafka.connect.source.SourceConnector;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.apache.kafka.connect.source.SourceTask;
@@ -605,6 +607,20 @@ public final class Worker {
                 new SinkTaskBuilder(id, configState, statusListener, initialState));
     }
 
+    public boolean startTransactionalShareSinkTask(
+            ConnectorTaskId id,
+            ClusterConfigState configState,
+            Map<String, String> connProps,
+            Map<String, String> taskProps,
+            TaskStatus.Listener statusListener,
+            TargetState initialState,
+            Runnable preProducerCheck,
+            Runnable postProducerCheck
+    ) {
+        return startTask(id, connProps, taskProps, configState, statusListener,
+            new TransactionalShareSinkTaskBuilder(id, configState, statusListener, initialState, preProducerCheck, postProducerCheck));
+    }
+
     /**
      * Start a source task managed by this worker using older behavior that does not provide exactly-once support.
      *
@@ -800,6 +816,9 @@ public final class Worker {
      * @return a {@link KafkaFuture} that will complete when the producers have all been fenced out, or the attempt has failed
      */
     public KafkaFuture<Void> fenceZombies(String connName, int numTasks, Map<String, String> connProps) {
+        if (SinkConnectorConfig.isTransactionalShareSink(connProps) && SinkConnector.class.isAssignableFrom(connectorClass(connProps))) {
+            return fenceTransactionalShareSinkZombies(connName, numTasks, connProps);
+        }
         log.debug("Fencing out {} task producers for source connector {}", numTasks, connName);
         try (LoggingContext loggingContext = LoggingContext.forConnector(connName)) {
             Class<? extends Connector> connectorClass = connectorClass(connProps);
@@ -836,6 +855,130 @@ public final class Worker {
                 }
             }
         }
+    }
+
+    private KafkaFuture<Void> fenceTransactionalShareSinkZombies(String connName, int numTasks, Map<String, String> connProps) {
+        requireTransactionalShareSinkWorker();
+        if (numTasks < 0) {
+            throw new ConnectException("The number of transactional share sink tasks to fence must not be negative");
+        }
+        if (numTasks == 0) {
+            return KafkaFuture.completedFuture(null);
+        }
+        Class<? extends Connector> connectorClass = connectorClass(connProps);
+        if (!SinkConnector.class.isAssignableFrom(connectorClass)) {
+            throw new ConnectException("Transactional share sink fencing requires a sink connector");
+        }
+        SinkConnectorConfig sinkConfig = new SinkConnectorConfig(plugins, connProps);
+        validateTransactionalShareGroup(sinkConfig, connName, null);
+        ConnectorTaskId id = new ConnectorTaskId(connName, 0);
+        Map<String, Object> consumerProps = transactionalShareSinkConsumerConfigs(id, config, sinkConfig, connectorClass,
+            connectorClientConfigOverridePolicy, kafkaClusterId);
+        Map<String, Object> producerProps = baseProducerConfigs(connName, "connector-share-producer-fencing-" + connName, config,
+            sinkConfig, connectorClass, connectorClientConfigOverridePolicy, kafkaClusterId, ConnectorType.SINK);
+        Map<String, Object> adminProps = adminConfigs(connName, "connector-share-sink-fencing-" + connName, config,
+            sinkConfig, connectorClass, connectorClientConfigOverridePolicy, kafkaClusterId, ConnectorType.SINK);
+        Collection<String> transactionalIds = IntStream.range(0, numTasks)
+            .mapToObj(task -> transactionalShareSinkTaskTransactionalId(config.groupId(), connName, task)).toList();
+        int timeoutMs = (int) RestServer.DEFAULT_REST_REQUEST_TIMEOUT_MS;
+        return TransactionalShareSinkAdmin.validateAndRun(adminFactory, consumerProps, producerProps, adminProps,
+            kafkaClusterId, sinkConfig.getString(SinkConnectorConfig.SHARE_GROUP_ID_CONFIG), 0,
+            timeoutMs, false, admin -> admin.fenceProducers(transactionalIds, new FenceProducersOptions().timeoutMs(timeoutMs)).all());
+    }
+
+    private void requireTransactionalShareSinkWorker() {
+        if (!(config instanceof DistributedConfig) || !config.exactlyOnceSourceEnabled()) {
+            throw new ConnectException("Transactional share sinks require a distributed worker with exactly.once.source.support=enabled for config-topic generation fencing");
+        }
+    }
+
+    private void validateTransactionalShareGroup(SinkConnectorConfig sinkConfig, String connector, ClusterConfigState configState) {
+        String shareGroup = sinkConfig.getString(SinkConnectorConfig.SHARE_GROUP_ID_CONFIG);
+        if (shareGroup.equals(config.groupId())) {
+            throw new ConnectException("share.group.id must be dedicated to the connector and differ from the Connect worker group");
+        }
+        if (configState != null) {
+            for (String other : configState.connectors()) {
+                Map<String, String> otherConfig = configState.connectorConfig(other);
+                if (!connector.equals(other) && otherConfig != null && SinkConnectorConfig.isTransactionalShareSink(otherConfig)
+                    && shareGroup.equals(otherConfig.get(SinkConnectorConfig.SHARE_GROUP_ID_CONFIG))) {
+                    throw new ConnectException("share.group.id is already used by connector " + other);
+                }
+            }
+        }
+    }
+
+    static Map<String, Object> transactionalShareSinkConsumerConfigs(ConnectorTaskId id, WorkerConfig workerConfig,
+                                                                    SinkConnectorConfig sinkConfig, Class<? extends Connector> connectorClass,
+                                                                    ConnectorClientConfigOverridePolicy overridePolicy, String clusterId) {
+        Map<String, Object> result = baseConsumerConfigs(id.connector(), "connector-share-consumer-" + id, workerConfig,
+            sinkConfig, connectorClass, overridePolicy, clusterId, ConnectorType.SINK);
+        result.remove(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG);
+        result.remove(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG);
+        ConnectUtils.ensureProperty(result, ConsumerConfig.GROUP_ID_CONFIG, sinkConfig.getString(SinkConnectorConfig.SHARE_GROUP_ID_CONFIG),
+            "for transactional share sinks", true);
+        ConnectUtils.ensureProperty(result, ConsumerConfig.SHARE_ACKNOWLEDGEMENT_MODE_CONFIG, "transactional", "for transactional share sinks", true);
+        ConnectUtils.ensureProperty(result, ConsumerConfig.SHARE_ACQUIRE_MODE_CONFIG, "record_limit", "for transactional share sinks", true);
+        boundTransactionalShareSinkConsumerTimeouts(result, 10000);
+        return result;
+    }
+
+    private static void boundTransactionalShareSinkConsumerTimeouts(Map<String, Object> consumerProps, long processingTimeoutMs) {
+        consumerProps.put(ConsumerConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, Math.toIntExact(processingTimeoutMs));
+        consumerProps.put(ConsumerConfig.REQUEST_TIMEOUT_MS_CONFIG, Math.toIntExact(Math.min(
+            Long.parseLong(Objects.toString(consumerProps.getOrDefault(ConsumerConfig.REQUEST_TIMEOUT_MS_CONFIG, 30000))), Math.max(1, processingTimeoutMs / 2))));
+    }
+
+    static Map<String, Object> transactionalShareSinkProducerConfigs(ConnectorTaskId id, WorkerConfig workerConfig,
+                                                                    SinkConnectorConfig sinkConfig, Class<? extends Connector> connectorClass,
+                                                                    ConnectorClientConfigOverridePolicy overridePolicy, String clusterId) {
+        Map<String, Object> result = baseProducerConfigs(id.connector(), "connector-share-producer-" + id, workerConfig,
+            sinkConfig, connectorClass, overridePolicy, clusterId, ConnectorType.SINK);
+        ConnectUtils.ensureProperty(result, ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true", "for transactional share sinks", false);
+        ConnectUtils.ensureProperty(result, ProducerConfig.ACKS_CONFIG, "all", "for transactional share sinks", false);
+        ConnectUtils.ensureProperty(result, ProducerConfig.TRANSACTION_TWO_PHASE_COMMIT_ENABLE_CONFIG, "false", "for transactional share sinks", false);
+        ConnectUtils.ensureProperty(result, ProducerConfig.TRANSACTIONAL_ID_CONFIG,
+            transactionalShareSinkTaskTransactionalId(workerConfig.groupId(), id.connector(), id.task()), "for transactional share sinks", true);
+        long processingTimeoutMs = transactionalShareSinkProcessingTimeoutMs(result);
+        result.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, Math.min(Long.parseLong(Objects.toString(result.get(ProducerConfig.MAX_BLOCK_MS_CONFIG))), processingTimeoutMs));
+        result.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, Math.toIntExact(Math.min(Long.parseLong(Objects.toString(result.getOrDefault(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 30000))), Math.max(1, processingTimeoutMs / 2))));
+        result.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, Math.toIntExact(Math.min(Long.parseLong(Objects.toString(result.get(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG))), processingTimeoutMs)));
+        return result;
+    }
+
+    private static long transactionalShareSinkProcessingTimeoutMs(Map<String, Object> producerProps) {
+        long transactionTimeoutMs = Long.parseLong(Objects.toString(producerProps.getOrDefault(ProducerConfig.TRANSACTION_TIMEOUT_CONFIG, 60000)));
+        long processingTimeoutMs = Math.min(10000, Math.max(1, transactionTimeoutMs / 2));
+        if (transactionTimeoutMs <= processingTimeoutMs + 1000) {
+            throw new ConnectException("Transactional share sinks require transaction.timeout.ms to leave a processing and recovery margin");
+        }
+        return processingTimeoutMs;
+    }
+
+    private static void validateTransactionalShareSinkTransforms(ConnectorConfig config,
+                                                                 TransformationChain<ConsumerRecord<byte[], byte[]>, SinkRecord> transformations,
+                                                                 long processingTimeoutMs) {
+        if (config.errorRetryTimeout() < 0 || config.errorRetryTimeout() > processingTimeoutMs) {
+            throw new ConnectException("Transactional share sinks require a finite errors.retry.timeout within the processing budget");
+        }
+        Set<String> transforms = Set.of("org.apache.kafka.connect.transforms.Filter",
+            "org.apache.kafka.connect.transforms.ExtractField$Key", "org.apache.kafka.connect.transforms.ExtractField$Value",
+            "org.apache.kafka.connect.transforms.ReplaceField$Key", "org.apache.kafka.connect.transforms.ReplaceField$Value",
+            "org.apache.kafka.connect.transforms.Cast$Key", "org.apache.kafka.connect.transforms.Cast$Value",
+            "org.apache.kafka.connect.transforms.MaskField$Key", "org.apache.kafka.connect.transforms.MaskField$Value",
+            "org.apache.kafka.connect.transforms.RegexRouter", "org.apache.kafka.connect.transforms.ValueToKey");
+        Set<String> predicates = Set.of("org.apache.kafka.connect.transforms.predicates.HasHeaderKey",
+            "org.apache.kafka.connect.transforms.predicates.RecordIsTombstone", "org.apache.kafka.connect.transforms.predicates.TopicNameMatches");
+        for (TransformationStage.StageInfo stage : transformations.transformationChainInfo()) {
+            if (!transforms.contains(stage.transform().className())
+                || (stage.predicate() != null && !predicates.contains(stage.predicate().className()))) {
+                throw new ConnectException("Transactional share sinks require an allowed stateless built-in transform and predicate");
+            }
+        }
+    }
+
+    public static String transactionalShareSinkTaskTransactionalId(String groupId, String connector, int taskId) {
+        return "connect-share-sink-" + groupId.length() + "-" + groupId + "-" + connector.length() + "-" + connector + "-" + taskId;
     }
 
     static Map<String, Object> exactlyOnceSourceTaskProducerConfigs(ConnectorTaskId id,
@@ -879,6 +1022,18 @@ public final class Worker {
                                                Class<? extends Connector>  connectorClass,
                                                ConnectorClientConfigOverridePolicy connectorClientConfigOverridePolicy,
                                                String clusterId) {
+        return baseProducerConfigs(connName, defaultClientId, config, connConfig, connectorClass,
+            connectorClientConfigOverridePolicy, clusterId, ConnectorType.SOURCE);
+    }
+
+    private static Map<String, Object> baseProducerConfigs(String connName,
+                                                          String defaultClientId,
+                                                          WorkerConfig config,
+                                                          ConnectorConfig connConfig,
+                                                          Class<? extends Connector> connectorClass,
+                                                          ConnectorClientConfigOverridePolicy connectorClientConfigOverridePolicy,
+                                                          String clusterId,
+                                                          ConnectorType connectorType) {
         Map<String, Object> producerProps = new HashMap<>();
         producerProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, config.bootstrapServers());
         producerProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.ByteArraySerializer");
@@ -904,7 +1059,7 @@ public final class Worker {
         // Connector-specified overrides
         Map<String, Object> producerOverrides =
             connectorClientConfigOverrides(connName, connConfig, connectorClass, ConnectorConfig.CONNECTOR_CLIENT_PRODUCER_OVERRIDES_PREFIX,
-                                           ConnectorType.SOURCE, ConnectorClientConfigRequest.ClientType.PRODUCER,
+                                           connectorType, ConnectorClientConfigRequest.ClientType.PRODUCER,
                                            connectorClientConfigOverridePolicy);
         producerProps.putAll(producerOverrides);
 
@@ -1323,6 +1478,10 @@ public final class Worker {
      */
     void sinkConnectorOffsets(String connName, Connector connector, Map<String, String> connectorConfig,
                               Callback<ConnectorOffsets> cb) {
+        if (SinkConnectorConfig.isTransactionalShareSink(connectorConfig)) {
+            cb.onCompletion(new ConnectException("Classic consumer offsets do not represent transactional share sink progress"), null);
+            return;
+        }
         Map<String, Object> adminConfig = adminConfigs(
                 connName,
                 "connector-worker-adminclient-" + connName,
@@ -1459,6 +1618,10 @@ public final class Worker {
      */
     void modifySinkConnectorOffsets(String connName, Connector connector, Map<String, String> connectorConfig,
                                     Map<Map<String, ?>, Map<String, ?>> offsets, boolean replaceAllOffsets, ClassLoader connectorLoader, Callback<Message> cb) {
+        if (SinkConnectorConfig.isTransactionalShareSink(connectorConfig)) {
+            cb.onCompletion(new ConnectException("Classic consumer offset changes are unsupported for transactional share sinks"), null);
+            return;
+        }
         executor.submit(plugins.withClassLoader(connectorLoader, () -> {
             try {
                 Timer timer = time.timer(Duration.ofMillis(RestServer.DEFAULT_REST_REQUEST_TIMEOUT_MS));
@@ -2005,6 +2168,9 @@ public final class Worker {
                 TaskPluginsMetadata taskPluginsMetadata
         ) {
             SinkConnectorConfig sinkConfig = new SinkConnectorConfig(plugins, connectorConfig.originalsStrings());
+            if ("share".equals(sinkConfig.getString(SinkConnectorConfig.CONSUMER_TYPE_CONFIG)) || task instanceof TransactionalShareSinkTask) {
+                throw new ConnectException("Transactional share sink tasks must use the distributed transactional share startup path");
+            }
             WorkerErrantRecordReporter workerErrantRecordReporter = createWorkerErrantRecordReporter(sinkConfig, retryWithToleranceOperator,
                     keyConverterPlugin.get(), valueConverterPlugin.get(), headerConverterPlugin.get());
 
@@ -2017,6 +2183,86 @@ public final class Worker {
                     valueConverterPlugin, errorHandlingMetrics, headerConverterPlugin, transformationChain, consumer, classLoader, time,
                     retryWithToleranceOperator, workerErrantRecordReporter, herder.statusBackingStore(),
                     () -> sinkTaskReporters(id, sinkConfig, errorHandlingMetrics, connectorClass), taskPluginsMetadata, plugins.safeLoaderSwapper());
+        }
+    }
+
+    class TransactionalShareSinkTaskBuilder extends TaskBuilder<ConsumerRecord<byte[], byte[]>, SinkRecord> {
+        private final Runnable preProducerCheck;
+        private final Runnable postProducerCheck;
+
+        TransactionalShareSinkTaskBuilder(ConnectorTaskId id, ClusterConfigState configState,
+                                          TaskStatus.Listener statusListener, TargetState initialState,
+                                          Runnable preProducerCheck, Runnable postProducerCheck) {
+            super(id, configState, statusListener, initialState);
+            this.preProducerCheck = Objects.requireNonNull(preProducerCheck);
+            this.postProducerCheck = Objects.requireNonNull(postProducerCheck);
+        }
+
+        @Override
+        public WorkerTask<ConsumerRecord<byte[], byte[]>, SinkRecord> doBuild(
+                Task task, ConnectorTaskId id, ClusterConfigState configState, TaskStatus.Listener statusListener,
+                TargetState initialState, ConnectorConfig connectorConfig, Plugin<Converter> keyConverterPlugin,
+                Plugin<Converter> valueConverterPlugin, Plugin<HeaderConverter> headerConverterPlugin, ClassLoader classLoader,
+                RetryWithToleranceOperator<ConsumerRecord<byte[], byte[]>> retryWithToleranceOperator,
+                TransformationChain<ConsumerRecord<byte[], byte[]>, SinkRecord> transformationChain,
+                ErrorHandlingMetrics errorHandlingMetrics, Class<? extends Connector> connectorClass,
+                TaskPluginsMetadata pluginsMetadata) {
+            requireTransactionalShareSinkWorker();
+            SinkConnectorConfig sinkConfig = new SinkConnectorConfig(plugins, connectorConfig.originalsStrings());
+            if (!SinkConnectorConfig.isTransactionalShareSink(sinkConfig.originalsStrings()) || !(task instanceof TransactionalShareSinkTask shareTask)
+                || !SinkConnector.class.isAssignableFrom(connectorClass)) {
+                throw new ConnectException("Transactional share startup requires an opted-in sink connector and TransactionalShareSinkTask");
+            }
+            validateTransactionalShareGroup(sinkConfig, id.connector(), configState);
+            Map<String, Object> consumerProps = transactionalShareSinkConsumerConfigs(id, config, sinkConfig, connectorClass,
+                connectorClientConfigOverridePolicy, kafkaClusterId);
+            Map<String, Object> producerProps = transactionalShareSinkProducerConfigs(id, config, sinkConfig, connectorClass,
+                connectorClientConfigOverridePolicy, kafkaClusterId);
+            Map<String, Object> adminProps = adminConfigs(id.connector(), "connector-share-admin-" + id, config,
+                sinkConfig, connectorClass, connectorClientConfigOverridePolicy, kafkaClusterId, ConnectorType.SINK);
+            long processingTimeoutMs = transactionalShareSinkProcessingTimeoutMs(producerProps);
+            validateTransactionalShareSinkTransforms(connectorConfig, transformationChain, processingTimeoutMs);
+            boundTransactionalShareSinkConsumerTimeouts(consumerProps, processingTimeoutMs);
+            int maxPollRecords = Integer.parseInt(Objects.toString(consumerProps.getOrDefault(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, ConsumerConfig.DEFAULT_MAX_POLL_RECORDS)));
+            int maxOutputRecords = (int) Math.min(10000L, Math.max(1L, maxPollRecords * 10L));
+            long maxOutputBytes = Math.min(16 * 1024 * 1024L,
+                Long.parseLong(Objects.toString(producerProps.getOrDefault(ProducerConfig.BUFFER_MEMORY_CONFIG, 32 * 1024 * 1024L))));
+            Runnable checkedPreProducer = () -> {
+                preProducerCheck.run();
+                int timeoutMs = (int) RestServer.DEFAULT_REST_REQUEST_TIMEOUT_MS;
+                KafkaFuture<Void> validation = TransactionalShareSinkAdmin.validateAndRun(adminFactory, consumerProps, producerProps,
+                    adminProps, kafkaClusterId, sinkConfig.getString(SinkConnectorConfig.SHARE_GROUP_ID_CONFIG), processingTimeoutMs,
+                    timeoutMs, true, admin -> KafkaFuture.completedFuture(null));
+                try {
+                    validation.get(timeoutMs, TimeUnit.MILLISECONDS);
+                } catch (InterruptedException e) {
+                    validation.cancel(true);
+                    Thread.currentThread().interrupt();
+                    throw new ConnectException("Interrupted validating transactional share sink clients", e);
+                } catch (ExecutionException | TimeoutException e) {
+                    validation.cancel(true);
+                    throw new ConnectException("Unable to validate transactional share sink clients", e);
+                }
+            };
+            KafkaShareConsumer<byte[], byte[]> consumer = new KafkaShareConsumer<>(consumerProps);
+            KafkaProducer<byte[], byte[]> producer = null;
+            try {
+                producer = new KafkaProducer<>(producerProps);
+                WorkerTransactionalShareSinkTask.Resources resources = new WorkerTransactionalShareSinkTask.Resources(
+                    config, configState, metrics, keyConverterPlugin, valueConverterPlugin, errorHandlingMetrics,
+                    headerConverterPlugin, transformationChain, retryWithToleranceOperator, herder.statusBackingStore(),
+                    List::of, pluginsMetadata, plugins.safeLoaderSwapper());
+                return new WorkerTransactionalShareSinkTask(id, shareTask, statusListener, initialState, resources,
+                    consumer, producer, classLoader, time, checkedPreProducer, postProducerCheck,
+                    processingTimeoutMs, maxOutputRecords, maxOutputBytes);
+            } catch (RuntimeException | Error e) {
+                Utils.closeQuietly(() -> consumer.close(Duration.ZERO), "transactional share consumer");
+                KafkaProducer<byte[], byte[]> createdProducer = producer;
+                if (createdProducer != null) {
+                    Utils.closeQuietly(() -> createdProducer.close(Duration.ZERO), "transactional share producer");
+                }
+                throw e;
+            }
         }
     }
 
