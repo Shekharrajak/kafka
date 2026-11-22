@@ -62,6 +62,8 @@ import org.apache.kafka.timeline.SnapshotRegistry;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.HashMap;
 import java.util.List;
@@ -2439,6 +2441,39 @@ class ShareCoordinatorShardTest {
         shard.replay(5L, -1L, (short) -1, covering.records().get(0));
         assertEquals(Optional.empty(), shard.lastRedundantOffset().response());
         assertTrue(shard.transactionCompletion(17L, (short) 2).isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 100})
+    public void testFencedFrontierWriteRetainsCommittedTerminalCount(int snapshotUpdateLimit) {
+        shard = new ShareCoordinatorShardBuilder().setConfigOverrides(Map.of(
+            ShareCoordinatorConfig.SNAPSHOT_UPDATE_RECORDS_PER_SNAPSHOT_CONFIG, Integer.toString(snapshotUpdateLimit))).build();
+        Uuid incarnation = activateTransactionalState();
+        CoordinatorRecord staged = shard.writeState(transactionalWrite(incarnation, transactionalWriter, 0, 9, (byte) 2))
+            .records().get(0);
+        shard.replay(3L, 17L, (short) 2, staged);
+        WriteShareGroupStateRequestData delayed = transactionalWrite(incarnation, transactionalWriter, 10, 10, (byte) 0)
+            .setTransactionalId(null).setProducerId(-1).setProducerEpoch((short) -1);
+        delayed.topics().get(0).partitions().get(0).setStartOffset(5).setDeliveryCompleteCount(0);
+
+        shard.replayEndTransactionMarker(17L, (short) 3, TransactionResult.COMMIT);
+        assertEquals(10, shard.getShareStateMapValue(SHARE_PARTITION_KEY).deliveryCompleteCount());
+        CoordinatorResult<WriteShareGroupStateResponseData, CoordinatorRecord> written = shard.writeState(delayed);
+        assertEquals(Errors.NONE.code(), written.response().results().get(0).partitions().get(0).errorCode());
+        CoordinatorRecord record = written.records().get(0);
+        if (snapshotUpdateLimit == 0) {
+            assertEquals(5, assertInstanceOf(ShareSnapshotValue.class, record.value().message()).deliveryCompleteCount());
+        } else {
+            assertEquals(5, assertInstanceOf(ShareUpdateValue.class, record.value().message()).deliveryCompleteCount());
+        }
+        shard.replay(4L, -1L, (short) -1, record);
+
+        ShareGroupOffset persisted = shard.getShareStateMapValue(SHARE_PARTITION_KEY);
+        assertEquals(5, persisted.startOffset());
+        assertEquals(5, persisted.deliveryCompleteCount());
+        assertEquals(List.of(new PersisterStateBatch(5, 9, (byte) 2, (short) 1),
+            new PersisterStateBatch(10, 10, (byte) 0, (short) 1)), persisted.stateBatches());
+        assertEquals(10, persisted.startOffset() + persisted.deliveryCompleteCount());
     }
 
     @Test
