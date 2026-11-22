@@ -241,7 +241,11 @@ import org.apache.kafka.common.message.StreamsGroupTopologyDescriptionUpdateResp
 import org.apache.kafka.common.message.SyncGroupRequestData;
 import org.apache.kafka.common.message.SyncGroupRequestData.SyncGroupRequestAssignment;
 import org.apache.kafka.common.message.SyncGroupResponseData;
+import org.apache.kafka.common.message.TxnCompleteRequestData;
+import org.apache.kafka.common.message.TxnCompleteResponseData;
 import org.apache.kafka.common.message.TxnOffsetCommitRequestData;
+import org.apache.kafka.common.message.TxnShareAcknowledgeRequestData;
+import org.apache.kafka.common.message.TxnShareAcknowledgeResponseData;
 import org.apache.kafka.common.message.UnregisterBrokerRequestData;
 import org.apache.kafka.common.message.UnregisterBrokerResponseData;
 import org.apache.kafka.common.message.UnregisterControllerRequestData;
@@ -1145,6 +1149,8 @@ public class RequestResponseTest {
             case SHARE_GROUP_DESCRIBE: return createShareGroupDescribeRequest(version);
             case SHARE_FETCH: return createShareFetchRequest(version);
             case SHARE_ACKNOWLEDGE: return createShareAcknowledgeRequest(version);
+            case TXN_SHARE_ACKNOWLEDGE: return createTxnShareAcknowledgeRequest(version);
+            case TXN_COMPLETE: return createTxnCompleteRequest(version);
             case ADD_RAFT_VOTER: return createAddRaftVoterRequest(version);
             case REMOVE_RAFT_VOTER: return createRemoveRaftVoterRequest(version);
             case UPDATE_RAFT_VOTER: return createUpdateRaftVoterRequest(version);
@@ -1242,6 +1248,8 @@ public class RequestResponseTest {
             case SHARE_GROUP_DESCRIBE: return createShareGroupDescribeResponse();
             case SHARE_FETCH: return createShareFetchResponse();
             case SHARE_ACKNOWLEDGE: return createShareAcknowledgeResponse();
+            case TXN_SHARE_ACKNOWLEDGE: return new TxnShareAcknowledgeResponse(new TxnShareAcknowledgeResponseData());
+            case TXN_COMPLETE: return new TxnCompleteResponse(new TxnCompleteResponseData());
             case ADD_RAFT_VOTER: return createAddRaftVoterResponse();
             case REMOVE_RAFT_VOTER: return createRemoveRaftVoterResponse();
             case UPDATE_RAFT_VOTER: return createUpdateRaftVoterResponse();
@@ -1559,6 +1567,19 @@ public class RequestResponseTest {
         LinkedHashMap<TopicIdPartition, ShareFetchResponseData.PartitionData> topicIdPartitionToPartition = new LinkedHashMap<>();
         topicIdPartitionToPartition.put(topicIdPartition, partition);
         return ShareFetchResponse.of(Errors.NONE, 345, topicIdPartitionToPartition, List.of(), 0);
+    }
+
+    private TxnShareAcknowledgeRequest createTxnShareAcknowledgeRequest(short version) {
+        return new TxnShareAcknowledgeRequest.Builder(new TxnShareAcknowledgeRequestData()
+            .setTransactionalId("transactional-id").setGroupId("share-group")
+            .setProducerId(42L).setProducerEpoch((short) 7)
+            .setMemberId(Uuid.randomUuid().toString()).setShareSessionEpoch(1), true).build(version);
+    }
+
+    private TxnCompleteRequest createTxnCompleteRequest(short version) {
+        return new TxnCompleteRequest.Builder(new TxnCompleteRequestData().setTransactions(List.of(
+            new TxnCompleteRequestData.TxnCompleteTransaction().setTransactionalId("transactional-id")
+                .setProducerId(42L).setProducerEpoch((short) 7).setTransactionResult(true))), true).build(version);
     }
 
     private ShareAcknowledgeRequest createShareAcknowledgeRequest(short version) {

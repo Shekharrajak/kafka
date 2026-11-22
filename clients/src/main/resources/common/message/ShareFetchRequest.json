@@ -23,7 +23,9 @@
   // Version 1 is the initial stable version (KIP-932).
   //
   // Version 2 introduces ShareAcquireMode and Renew acknowledgements (KIP-1206 and KIP-1222).
-  "validVersions": "1-2",
+  // Version 3 requests acquisition identities in the response (KIP-1289).
+  "validVersions": "1-3",
+  "latestVersionUnstable": true,
   "flexibleVersions": "0+",
   "headerVersions": {
     "0+": "2"
