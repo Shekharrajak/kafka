@@ -81,6 +81,10 @@ public class SharePartitionCache {
         return partitions.remove(partitionKey);
     }
 
+    synchronized SharePartition remove(SharePartitionKey partitionKey, SharePartition expected) {
+        return partitions.get(partitionKey) == expected ? remove(partitionKey) : null;
+    }
+
     /**
      * Computes the value for the given key if it is not already present in the cache. Method also
      * updates the group map with the topic-partition for the group id.

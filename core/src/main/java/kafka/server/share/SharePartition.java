@@ -32,7 +32,10 @@ import org.apache.kafka.common.errors.NotLeaderOrFollowerException;
 import org.apache.kafka.common.errors.UnknownServerException;
 import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
 import org.apache.kafka.common.message.FetchResponseData;
+import org.apache.kafka.common.message.ReadShareGroupStateResponseData;
 import org.apache.kafka.common.message.ShareFetchResponseData.AcquiredRecords;
+import org.apache.kafka.common.message.TxnShareAcknowledgeRequestData;
+import org.apache.kafka.common.message.WriteShareGroupStateRequestData;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.record.internal.ControlRecordType;
 import org.apache.kafka.common.record.internal.Record;
@@ -42,6 +45,7 @@ import org.apache.kafka.common.utils.Utils;
 import org.apache.kafka.coordinator.group.ShareGroupAutoOffsetResetStrategy;
 import org.apache.kafka.coordinator.group.modern.share.ShareGroupConfigProvider;
 import org.apache.kafka.server.share.PartitionMetadataProvider;
+import org.apache.kafka.server.share.SharePartitionKey;
 import org.apache.kafka.server.share.acknowledge.ShareAcknowledgementBatch;
 import org.apache.kafka.server.share.dlq.ShareGroupDLQManager;
 import org.apache.kafka.server.share.dlq.ShareGroupDLQRecordParameter;
@@ -69,6 +73,7 @@ import org.apache.kafka.server.share.persister.WriteShareGroupStateParameters;
 import org.apache.kafka.server.storage.log.FetchIsolation;
 import org.apache.kafka.server.storage.log.FetchPartitionData;
 import org.apache.kafka.server.util.timer.Timer;
+import org.apache.kafka.server.util.timer.TimerTask;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -78,6 +83,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
@@ -85,12 +91,14 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.PriorityQueue;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -99,7 +107,7 @@ import java.util.function.Supplier;
  * consumers. The class maintains the state of the records that have been fetched from the leader
  * and are in-flight.
  */
-@SuppressWarnings({"ClassDataAbstractionCoupling", "ClassFanOutComplexity"})
+@SuppressWarnings({"ClassDataAbstractionCoupling", "ClassFanOutComplexity", "JavaNCSS"})
 public class SharePartition implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(SharePartition.class);
@@ -333,6 +341,12 @@ public class SharePartition implements AutoCloseable {
      * Reference to the DLQ manager implementation.
      */
     private final ShareGroupDLQManager shareGroupDLQManager;
+    private final BooleanSupplier transactionalAcksEnabled;
+    private final NavigableMap<Long, TransactionalReservation> transactionalReservations = new TreeMap<>();
+    private Uuid stateIncarnationId = Uuid.ZERO_UUID;
+    private Uuid writerGeneration = Uuid.ZERO_UUID;
+    private TimerTask transactionalReconcileTask;
+    private boolean transactionalReadInProgress;
 
     @SuppressWarnings("ParameterNumber")
     SharePartition(
@@ -358,6 +372,32 @@ public class SharePartition implements AutoCloseable {
             shareGroupDLQManager);
     }
 
+    @SuppressWarnings("ParameterNumber")
+    SharePartition(
+        String groupId,
+        TopicIdPartition topicIdPartition,
+        int leaderEpoch,
+        int defaultMaxInFlightRecords,
+        int defaultMaxDeliveryCount,
+        int defaultRecordLockDurationMs,
+        Timer timer,
+        Time time,
+        Persister persister,
+        PartitionMetadataProvider metadataProvider,
+        Consumer<DelayedShareFetchKey> delayedRequestNotifier,
+        ShareGroupConfigProvider configProvider,
+        SharePartitionListener listener,
+        Supplier<Boolean> shareGroupDlqEnableSupplier,
+        ShareGroupDLQManager shareGroupDLQManager,
+        BooleanSupplier transactionalAcksEnabled
+    ) {
+        this(groupId, topicIdPartition, leaderEpoch, defaultMaxInFlightRecords, defaultMaxDeliveryCount,
+            defaultRecordLockDurationMs, timer, time, persister, metadataProvider, delayedRequestNotifier,
+            configProvider, SharePartitionState.EMPTY, listener,
+            new SharePartitionMetrics(groupId, topicIdPartition.topic(), topicIdPartition.partition()),
+            shareGroupDlqEnableSupplier, shareGroupDLQManager, transactionalAcksEnabled);
+    }
+
     // Visible for testing
     @SuppressWarnings("ParameterNumber")
     SharePartition(
@@ -378,6 +418,34 @@ public class SharePartition implements AutoCloseable {
         SharePartitionMetrics sharePartitionMetrics,
         Supplier<Boolean> shareGroupDlqEnableSupplier,
         ShareGroupDLQManager shareGroupDLQManager
+    ) {
+        this(groupId, topicIdPartition, leaderEpoch, defaultMaxInFlightRecords, defaultMaxDeliveryCount,
+            defaultRecordLockDurationMs, timer, time, persister, metadataProvider, delayedRequestNotifier,
+            configProvider, sharePartitionState, listener, sharePartitionMetrics, shareGroupDlqEnableSupplier,
+            shareGroupDLQManager, () -> false);
+    }
+
+    // Visible for testing
+    @SuppressWarnings("ParameterNumber")
+    SharePartition(
+        String groupId,
+        TopicIdPartition topicIdPartition,
+        int leaderEpoch,
+        int defaultMaxInFlightRecords,
+        int defaultMaxDeliveryCount,
+        int defaultRecordLockDurationMs,
+        Timer timer,
+        Time time,
+        Persister persister,
+        PartitionMetadataProvider metadataProvider,
+        Consumer<DelayedShareFetchKey> delayedRequestNotifier,
+        ShareGroupConfigProvider configProvider,
+        SharePartitionState sharePartitionState,
+        SharePartitionListener listener,
+        SharePartitionMetrics sharePartitionMetrics,
+        Supplier<Boolean> shareGroupDlqEnableSupplier,
+        ShareGroupDLQManager shareGroupDLQManager,
+        BooleanSupplier transactionalAcksEnabled
     ) {
         this.groupId = groupId;
         this.topicIdPartition = topicIdPartition;
@@ -405,6 +473,477 @@ public class SharePartition implements AutoCloseable {
         this.deliveryCompleteCount = new AtomicInteger(0);
         this.shareGroupDlqEnableSupplier = shareGroupDlqEnableSupplier;
         this.shareGroupDLQManager = shareGroupDLQManager;
+        this.transactionalAcksEnabled = transactionalAcksEnabled;
+    }
+
+    private Uuid nextAcquisitionId() {
+        return transactionalAcksEnabled.getAsBoolean() ? Uuid.randomUuid() : Uuid.ZERO_UUID;
+    }
+
+    private SharePartitionKey sharePartitionKey() {
+        return new SharePartitionKey(groupId, topicIdPartition);
+    }
+
+    private ReadShareGroupStateResponseData.PartitionResult validateTransactionalRead(
+        ReadShareGroupStateResponseData.PartitionResult result
+    ) {
+        if (result == null || result.partition() != topicIdPartition.partition()) {
+            throw new IllegalStateException("Invalid fenced share-state response");
+        }
+        if (result.errorCode() != Errors.NONE.code()) {
+            throw fetchPersisterError(result.errorCode(), result.errorMessage());
+        }
+        return result;
+    }
+
+    private CompletableFuture<Void> initializeTransactionalState() {
+        Uuid newGeneration = Uuid.randomUuid();
+        CompletableFuture<Void> initialized;
+        try {
+            initialized = persister.readFencedState(sharePartitionKey(), leaderEpoch, Uuid.ZERO_UUID, Uuid.ZERO_UUID)
+                .thenApply(this::validateTransactionalRead)
+                .thenCompose(observed -> persister.readFencedState(sharePartitionKey(), leaderEpoch,
+                    observed.writerGeneration(), newGeneration))
+                .thenCompose(result -> {
+                    validateTransactionalRead(result);
+                    List<DlqBatch> dlq;
+                    lock.writeLock().lock();
+                    try {
+                        if (partitionState != SharePartitionState.INITIALIZING ||
+                            !newGeneration.equals(result.writerGeneration()) ||
+                            Uuid.ZERO_UUID.equals(result.stateIncarnationId())) {
+                            throw new NotLeaderOrFollowerException("Share-state writer claim was fenced");
+                        }
+                        stateEpoch = result.stateEpoch();
+                        stateIncarnationId = result.stateIncarnationId();
+                        writerGeneration = newGeneration;
+                        dlq = restoreTransactionalCache(result);
+                    } finally {
+                        lock.writeLock().unlock();
+                    }
+                    CompletableFuture<Void> baseline = result.startOffset() == PartitionFactory.UNINITIALIZED_START_OFFSET
+                        ? persister.writeFencedState(sharePartitionKey(), fencedWriteData(List.of()), null, -1, (short) -1)
+                        : CompletableFuture.completedFuture(null);
+                    return baseline.thenRun(() -> {
+                        lock.writeLock().lock();
+                        try {
+                            if (partitionState != SharePartitionState.INITIALIZING || !newGeneration.equals(writerGeneration)) {
+                                throw new NotLeaderOrFollowerException("Share-state initialization was fenced");
+                            }
+                            partitionState = SharePartitionState.ACTIVE;
+                            scheduleTransactionalReconciliation();
+                        } finally {
+                            lock.writeLock().unlock();
+                        }
+                        maybeResumeDlqArchiving(dlq);
+                    });
+                });
+        } catch (Throwable error) {
+            initialized = CompletableFuture.failedFuture(error);
+        }
+        return initialized.whenComplete((ignored, error) -> {
+            if (error != null) {
+                lock.writeLock().lock();
+                try {
+                    if (partitionState != SharePartitionState.FENCED) partitionState = SharePartitionState.FAILED;
+                } finally {
+                    lock.writeLock().unlock();
+                }
+            }
+        });
+    }
+
+    private List<DlqBatch> restoreTransactionalCache(ReadShareGroupStateResponseData.PartitionResult result) {
+        startOffset = startOffsetDuringInitialization(result.startOffset());
+        List<RestoredTransactionalRange> ranges = new ArrayList<>();
+        for (ReadShareGroupStateResponseData.StateBatch batch : result.stateBatches()) {
+            if (batch.lastOffset() >= startOffset) {
+                ranges.add(new RestoredTransactionalRange(Math.max(startOffset, batch.firstOffset()), batch.lastOffset(),
+                    RecordState.forId(batch.deliveryState()), batch.deliveryCount(), null));
+            }
+        }
+        for (ReadShareGroupStateResponseData.PendingTransaction transaction : result.pendingTransactions()) {
+            TransactionalOwner owner = new TransactionalOwner(transaction.transactionalId(),
+                transaction.producerId(), transaction.producerEpoch());
+            for (ReadShareGroupStateResponseData.StateBatch batch : transaction.stateBatches()) {
+                if (batch.firstOffset() < startOffset) {
+                    throw new IllegalStateException("Pending transactional range precedes the source frontier");
+                }
+                overlayTransactionalRange(ranges, new RestoredTransactionalRange(batch.firstOffset(), batch.lastOffset(),
+                    RecordState.forId(batch.deliveryState()), batch.deliveryCount(), owner));
+            }
+        }
+        ranges.sort(Comparator.comparingLong(RestoredTransactionalRange::firstOffset));
+        cachedState.clear();
+        transactionalReservations.clear();
+        deliveryCompleteCount.set(0);
+        List<DlqBatch> dlq = new ArrayList<>();
+        long previousOffset = startOffset - 1;
+        long gapStart = -1;
+        for (RestoredTransactionalRange range : ranges) {
+            if (range.lastOffset() < range.firstOffset() || range.firstOffset() <= previousOffset) {
+                throw new IllegalStateException("Invalid restored share-state ranges");
+            }
+            if (gapStart == -1 && range.firstOffset() > previousOffset + 1) gapStart = previousOffset + 1;
+            previousOffset = range.lastOffset();
+            InFlightBatch batch = new InFlightBatch(timer, time, EMPTY_MEMBER_ID, range.firstOffset(), range.lastOffset(),
+                range.owner() == null ? range.state() : RecordState.ACQUIRED, range.deliveryCount(), null,
+                timeoutHandler, sharePartitionMetrics);
+            cachedState.put(range.firstOffset(), batch);
+            sharePartitionMetrics.recordInFlightBatchMessageCount(range.lastOffset() - range.firstOffset() + 1);
+            if (range.owner() != null) {
+                validateTransactionalTarget(range.state());
+                InFlightState state = batch.startBatchStateTransition(range.state(), DeliveryCountOps.NO_OP,
+                    maxDeliveryCount(), EMPTY_MEMBER_ID, range.state() == RecordState.ARCHIVING);
+                if (state == null) throw new IllegalStateException("Cannot restore transactional transition");
+                transactionalReservations.put(range.firstOffset(), new TransactionalReservation(range.firstOffset(),
+                    range.lastOffset(), range.owner(), Uuid.ZERO_UUID, range.state(), state,
+                    CompletableFuture.completedFuture(null), true));
+            } else if (isStateTerminal(range.state())) {
+                deliveryCompleteCount.addAndGet(Math.toIntExact(range.lastOffset() - range.firstOffset() + 1));
+            } else if (range.state() == RecordState.ARCHIVING) {
+                dlq.add(new DlqBatch(batch::archiveBatch, range.firstOffset(), range.lastOffset(), range.deliveryCount()));
+            }
+        }
+        endOffset = cachedState.isEmpty() ? startOffset : cachedState.lastEntry().getValue().lastOffset();
+        persisterReadResultGapWindow = gapStart < 0 ? null : new GapWindow(endOffset, gapStart);
+        updateFindNextFetchOffset(!cachedState.isEmpty());
+        maybeUpdateCachedStateAndOffsets();
+        return dlq;
+    }
+
+    private void overlayTransactionalRange(List<RestoredTransactionalRange> ranges, RestoredTransactionalRange pending) {
+        List<RestoredTransactionalRange> replaced = new ArrayList<>();
+        for (RestoredTransactionalRange range : ranges) {
+            if (range.lastOffset() < pending.firstOffset() || range.firstOffset() > pending.lastOffset()) {
+                replaced.add(range);
+            } else {
+                if (range.owner() != null || range.state() != RecordState.AVAILABLE) {
+                    throw new IllegalStateException("Conflicting restored transactional ranges");
+                }
+                if (range.firstOffset() < pending.firstOffset()) {
+                    replaced.add(new RestoredTransactionalRange(range.firstOffset(), pending.firstOffset() - 1,
+                        range.state(), range.deliveryCount(), null));
+                }
+                if (range.lastOffset() > pending.lastOffset()) {
+                    replaced.add(new RestoredTransactionalRange(pending.lastOffset() + 1, range.lastOffset(),
+                        range.state(), range.deliveryCount(), null));
+                }
+            }
+        }
+        replaced.add(pending);
+        ranges.clear();
+        ranges.addAll(replaced);
+    }
+
+    private void validateTransactionalTarget(RecordState state) {
+        if (state != RecordState.ACKNOWLEDGED && state != RecordState.ARCHIVING && state != RecordState.ARCHIVED) {
+            throw new InvalidRecordStateException("Invalid transactional acknowledgement disposition");
+        }
+    }
+
+    public CompletableFuture<Void> acknowledgeTransactional(
+        String memberId,
+        String transactionalId,
+        long producerId,
+        short producerEpoch,
+        List<TxnShareAcknowledgeRequestData.AcknowledgementBatch> batches
+    ) {
+        CompletableFuture<Void> persistence = new CompletableFuture<>();
+        Set<CompletableFuture<Void>> dependencies = new LinkedHashSet<>();
+        List<TransactionalCandidate> candidates = new ArrayList<>();
+        List<TransactionalReservation> staged = new ArrayList<>();
+        TransactionalOwner owner = new TransactionalOwner(transactionalId, producerId, producerEpoch);
+        lock.writeLock().lock();
+        try {
+            if (!transactionalAcksEnabled.getAsBoolean() || partitionState != SharePartitionState.ACTIVE ||
+                Uuid.ZERO_UUID.equals(writerGeneration)) {
+                throw new NotLeaderOrFollowerException("Transactional share state is unavailable");
+            }
+            if (memberId == null || memberId.isEmpty() || transactionalId == null || transactionalId.isEmpty()) {
+                throw new InvalidRequestException("Invalid transactional acknowledgement identity or empty request");
+            }
+            if (producerId < 0 || producerEpoch < 0 || batches.isEmpty()) {
+                throw new InvalidRequestException("Invalid transactional acknowledgement identity or empty request");
+            }
+            List<TxnShareAcknowledgeRequestData.AcknowledgementBatch> ordered = new ArrayList<>(batches);
+            ordered.sort(Comparator.comparingLong(TxnShareAcknowledgeRequestData.AcknowledgementBatch::firstOffset));
+            long previousLastOffset = -1;
+            for (TxnShareAcknowledgeRequestData.AcknowledgementBatch batch : ordered) {
+                if (batch.firstOffset() <= previousLastOffset) {
+                    throw new InvalidRequestException("Overlapping transactional acknowledgement ranges");
+                }
+                collectTransactionalCandidates(memberId, owner, batch, candidates, dependencies);
+                previousLastOffset = batch.lastOffset();
+            }
+            for (TransactionalCandidate candidate : candidates) {
+                InFlightState state = candidate.batch() == null
+                    ? candidate.state().startStateTransition(candidate.target(), DeliveryCountOps.NO_OP,
+                        maxDeliveryCount(), EMPTY_MEMBER_ID, candidate.target() == RecordState.ARCHIVING)
+                    : candidate.batch().startBatchStateTransition(candidate.target(), DeliveryCountOps.NO_OP,
+                        maxDeliveryCount(), EMPTY_MEMBER_ID, candidate.target() == RecordState.ARCHIVING);
+                if (state == null) throw new IllegalStateException("Acquisition changed during transactional staging");
+                TransactionalReservation reservation = new TransactionalReservation(candidate.firstOffset(),
+                    candidate.lastOffset(), owner, candidate.acquisitionId(), candidate.target(), state, persistence, false);
+                transactionalReservations.put(reservation.firstOffset, reservation);
+                staged.add(reservation);
+            }
+            if (!staged.isEmpty()) dependencies.add(persistence);
+        } catch (Throwable error) {
+            for (TransactionalReservation reservation : staged) {
+                reservation.state.completeStateTransition(false);
+                transactionalReservations.remove(reservation.firstOffset);
+            }
+            return CompletableFuture.failedFuture(error);
+        } finally {
+            lock.writeLock().unlock();
+        }
+        if (!staged.isEmpty()) persistTransactionalReservations(owner, staged, persistence);
+        return CompletableFuture.allOf(dependencies.toArray(new CompletableFuture<?>[0]));
+    }
+
+    private void collectTransactionalCandidates(
+        String memberId,
+        TransactionalOwner owner,
+        TxnShareAcknowledgeRequestData.AcknowledgementBatch acknowledgement,
+        List<TransactionalCandidate> candidates,
+        Set<CompletableFuture<Void>> dependencies
+    ) {
+        long first = acknowledgement.firstOffset();
+        long last = acknowledgement.lastOffset();
+        List<Byte> types = acknowledgement.acknowledgeTypes();
+        if (first < startOffset || last < first || last > endOffset || acknowledgement.acquisitionId() == null ||
+            Uuid.ZERO_UUID.equals(acknowledgement.acquisitionId())) {
+            throw new InvalidRecordStateException("Transactional acknowledgement does not identify an acquired range");
+        }
+        if (types.size() != 1 && types.size() != last - first + 1) {
+            throw new InvalidRecordStateException("Transactional acknowledgement does not identify an acquired range");
+        }
+        for (long offset = first; offset <= last; offset++) {
+            byte ackType = types.get(types.size() == 1 ? 0 : Math.toIntExact(offset - first));
+            if (ackType != AcknowledgeType.ACCEPT.id && ackType != AcknowledgeType.REJECT.id) {
+                throw new InvalidRequestException("Only ACCEPT and REJECT can be transactionally staged");
+            }
+            RecordState target = recordStateWithDlq(ackType);
+            Map.Entry<Long, TransactionalReservation> held = transactionalReservations.floorEntry(offset);
+            if (held != null && held.getValue().lastOffset >= offset) {
+                TransactionalReservation reservation = held.getValue();
+                if (!owner.equals(reservation.owner) || !acknowledgement.acquisitionId().equals(reservation.acquisitionId) ||
+                    target != reservation.target) {
+                    throw new InvalidRecordStateException("A different transactional acknowledgement is pending");
+                }
+                dependencies.add(reservation.persistence);
+                continue;
+            }
+            Map.Entry<Long, InFlightBatch> entry = cachedState.floorEntry(offset);
+            if (entry == null || entry.getValue().lastOffset() < offset) {
+                throw new InvalidRecordStateException("Offset is not acquired");
+            }
+            InFlightBatch batch = entry.getValue();
+            if (batch.offsetState() == null && offset == batch.firstOffset() && batch.lastOffset() <= last && types.size() == 1) {
+                if (batch.batchState() != RecordState.ACQUIRED || batch.batchHasOngoingStateTransition() ||
+                    !memberId.equals(batch.batchMemberId()) || !acknowledgement.acquisitionId().equals(batch.batchAcquisitionId())) {
+                    throw new InvalidRecordStateException("Member does not own this acquisition");
+                }
+                candidates.add(new TransactionalCandidate(offset, batch.lastOffset(), batch, null,
+                    acknowledgement.acquisitionId(), target));
+                offset = batch.lastOffset();
+            } else {
+                if (batch.offsetState() == null) {
+                    if (batch.batchState() != RecordState.ACQUIRED || batch.batchHasOngoingStateTransition()) {
+                        throw new InvalidRecordStateException("Offset is not acquired");
+                    }
+                    batch.maybeInitializeOffsetStateUpdate();
+                }
+                InFlightState state = batch.offsetState().get(offset);
+                if (state == null || state.state() != RecordState.ACQUIRED || state.hasOngoingStateTransition() ||
+                    !memberId.equals(state.memberId()) || !acknowledgement.acquisitionId().equals(state.acquisitionId())) {
+                    throw new InvalidRecordStateException("Member does not own this acquisition");
+                }
+                candidates.add(new TransactionalCandidate(offset, offset, null, state, acknowledgement.acquisitionId(), target));
+            }
+            if (offset == Long.MAX_VALUE) break;
+        }
+    }
+
+    private void persistTransactionalReservations(
+        TransactionalOwner owner,
+        List<TransactionalReservation> staged,
+        CompletableFuture<Void> persistence
+    ) {
+        Uuid generation = writerGeneration;
+        CompletableFuture<Void> write;
+        try {
+            write = persister.writeFencedState(sharePartitionKey(), fencedWriteData(staged.stream()
+                .map(reservation -> new PersisterStateBatch(reservation.firstOffset, reservation.lastOffset,
+                    reservation.target.id(), (short) reservation.state.deliveryCount())).toList())
+                    .setStartOffset(-1).setDeliveryCompleteCount(-1),
+                owner.transactionalId(), owner.producerId(), owner.producerEpoch());
+        } catch (Throwable error) {
+            write = CompletableFuture.failedFuture(error);
+        }
+        write.whenComplete((ignored, error) -> {
+            Throwable failure = error;
+            lock.writeLock().lock();
+            try {
+                if (failure == null && (partitionState != SharePartitionState.ACTIVE || !generation.equals(writerGeneration))) {
+                    failure = new NotLeaderOrFollowerException("Share-state writer changed while staging");
+                }
+                if (failure == null) {
+                    staged.forEach(reservation -> reservation.durable = true);
+                    scheduleTransactionalReconciliation();
+                } else {
+                    partitionState = SharePartitionState.FENCED;
+                    failure = new NotLeaderOrFollowerException("Transactional share staging requires fenced recovery", failure);
+                }
+            } finally {
+                lock.writeLock().unlock();
+            }
+            if (failure == null) persistence.complete(null);
+            else persistence.completeExceptionally(failure);
+        });
+    }
+
+    private WriteShareGroupStateRequestData.PartitionData fencedWriteData(List<PersisterStateBatch> batches) {
+        lock.readLock().lock();
+        try {
+            return new WriteShareGroupStateRequestData.PartitionData().setPartition(topicIdPartition.partition())
+                .setStateEpoch(stateEpoch).setLeaderEpoch(leaderEpoch).setStateIncarnationId(stateIncarnationId)
+                .setWriterGeneration(writerGeneration).setStartOffset(startOffset)
+                .setDeliveryCompleteCount(deliveryCompleteCount.get()).setStateBatches(batches.stream()
+                    .map(batch -> new WriteShareGroupStateRequestData.StateBatch().setFirstOffset(batch.firstOffset())
+                        .setLastOffset(batch.lastOffset()).setDeliveryState(batch.deliveryState())
+                        .setDeliveryCount(batch.deliveryCount())).toList());
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    public void reconcileTransactionalAcknowledgements() {
+        List<TransactionalReservation> snapshot;
+        Uuid generation;
+        Uuid incarnation;
+        lock.writeLock().lock();
+        try {
+            if (partitionState != SharePartitionState.ACTIVE || transactionalReservations.isEmpty() || transactionalReadInProgress) return;
+            snapshot = transactionalReservations.values().stream().filter(reservation -> reservation.durable).toList();
+            if (snapshot.isEmpty()) return;
+            generation = writerGeneration;
+            incarnation = stateIncarnationId;
+            transactionalReadInProgress = true;
+        } finally {
+            lock.writeLock().unlock();
+        }
+        CompletableFuture<ReadShareGroupStateResponseData.PartitionResult> read;
+        try {
+            read = persister.readFencedState(sharePartitionKey(), leaderEpoch, Uuid.ZERO_UUID, Uuid.ZERO_UUID);
+        } catch (Throwable error) {
+            read = CompletableFuture.failedFuture(error);
+        }
+        read.whenComplete((result, error) -> completeTransactionalRead(snapshot, generation, incarnation, result, error));
+    }
+
+    private void completeTransactionalRead(
+        List<TransactionalReservation> snapshot,
+        Uuid generation,
+        Uuid incarnation,
+        ReadShareGroupStateResponseData.PartitionResult result,
+        Throwable error
+    ) {
+        List<DlqBatch> dlq = new ArrayList<>();
+        boolean changed = false;
+        lock.writeLock().lock();
+        try {
+            transactionalReadInProgress = false;
+            if (partitionState != SharePartitionState.ACTIVE || !generation.equals(writerGeneration)) return;
+            if (error != null) {
+                log.debug("Could not reconcile transactional acknowledgements for {}", sharePartitionKey(), error);
+                return;
+            }
+            validateTransactionalRead(result);
+            if (!generation.equals(result.writerGeneration()) || !incarnation.equals(result.stateIncarnationId()) ||
+                stateEpoch != result.stateEpoch()) {
+                partitionState = SharePartitionState.FENCED;
+                return;
+            }
+            for (TransactionalReservation reservation : snapshot) {
+                if (transactionalReservations.get(reservation.firstOffset) != reservation || !reservation.durable ||
+                    hasPendingTransactionalRange(result, reservation)) continue;
+                RecordState outcome = committedTransactionalOutcome(result, reservation);
+                if (outcome == null) continue;
+                reservation.state.completeTransactionalTransition(outcome);
+                transactionalReservations.remove(reservation.firstOffset);
+                if (outcome == RecordState.AVAILABLE) {
+                    updateFindNextFetchOffset(true);
+                } else if (outcome == RecordState.ARCHIVING) {
+                    dlq.add(new DlqBatch(reservation.state::archive, reservation.firstOffset, reservation.lastOffset,
+                        (short) reservation.state.deliveryCount()));
+                } else {
+                    deliveryCompleteCount.addAndGet(numInFlightRecordsInBatch(reservation.firstOffset, reservation.lastOffset));
+                }
+                changed = true;
+            }
+            if (changed) maybeUpdateCachedStateAndOffsets();
+        } catch (Throwable failure) {
+            log.warn("Invalid transactional recovery state for {}", sharePartitionKey(), failure);
+            partitionState = SharePartitionState.FENCED;
+        } finally {
+            try {
+                scheduleTransactionalReconciliation();
+            } finally {
+                lock.writeLock().unlock();
+            }
+        }
+        maybeCompleteDelayedShareFetchRequest(changed);
+        maybeResumeDlqArchiving(dlq);
+    }
+
+    private boolean hasPendingTransactionalRange(
+        ReadShareGroupStateResponseData.PartitionResult result,
+        TransactionalReservation reservation
+    ) {
+        for (ReadShareGroupStateResponseData.PendingTransaction transaction : result.pendingTransactions()) {
+            for (ReadShareGroupStateResponseData.StateBatch batch : transaction.stateBatches()) {
+                if (batch.firstOffset() <= reservation.lastOffset && batch.lastOffset() >= reservation.firstOffset) return true;
+            }
+        }
+        return false;
+    }
+
+    private RecordState committedTransactionalOutcome(
+        ReadShareGroupStateResponseData.PartitionResult result,
+        TransactionalReservation reservation
+    ) {
+        if (reservation.lastOffset < result.startOffset()) return RecordState.ARCHIVED;
+        long cursor = reservation.firstOffset;
+        RecordState outcome = null;
+        for (ReadShareGroupStateResponseData.StateBatch batch : result.stateBatches()) {
+            if (batch.lastOffset() < cursor) continue;
+            if (batch.firstOffset() > cursor) return null;
+            RecordState state = RecordState.forId(batch.deliveryState());
+            if (state == RecordState.ACQUIRED || (outcome != null && outcome != state)) return null;
+            outcome = state;
+            if (batch.lastOffset() >= reservation.lastOffset) return outcome;
+            cursor = batch.lastOffset() + 1;
+        }
+        return null;
+    }
+
+    private void scheduleTransactionalReconciliation() {
+        if (partitionState != SharePartitionState.ACTIVE || transactionalReservations.isEmpty() || transactionalReconcileTask != null) return;
+        transactionalReconcileTask = new TimerTask(1000) {
+            @Override
+            public void run() {
+                lock.writeLock().lock();
+                try {
+                    transactionalReconcileTask = null;
+                } finally {
+                    lock.writeLock().unlock();
+                }
+                reconcileTransactionalAcknowledgements();
+            }
+        };
+        timer.add(transactionalReconcileTask);
     }
 
     /**
@@ -433,6 +972,10 @@ public class SharePartition implements AutoCloseable {
             if (!emptyToInitialState()) return CompletableFuture.completedFuture(null);
         } catch (Exception e) {
             return CompletableFuture.failedFuture(e);
+        }
+
+        if (transactionalAcksEnabled.getAsBoolean()) {
+            return initializeTransactionalState();
         }
 
         // The share partition is not initialized, hence try to initialize it. There shall be only one
@@ -965,6 +1508,7 @@ public class SharePartition implements AutoCloseable {
                         inFlightBatch, groupId, topicIdPartition);
                     continue;
                 }
+                updateResult.updateAcquisitionId(nextAcquisitionId());
                 // Schedule acquisition lock timeout for the batch.
                 AcquisitionLockTimerTask acquisitionLockTimeoutTask = scheduleAcquisitionLockTimeout(memberId, inFlightBatch.firstOffset(), inFlightBatch.lastOffset());
                 // Set the acquisition lock timeout task for the batch.
@@ -973,7 +1517,8 @@ public class SharePartition implements AutoCloseable {
                 result.add(new AcquiredRecords()
                     .setFirstOffset(inFlightBatch.firstOffset())
                     .setLastOffset(inFlightBatch.lastOffset())
-                    .setDeliveryCount((short) inFlightBatch.batchDeliveryCount()));
+                    .setDeliveryCount((short) inFlightBatch.batchDeliveryCount())
+                    .setAcquisitionId(updateResult.acquisitionId()));
                 acquiredCount += (int) (inFlightBatch.lastOffset() - inFlightBatch.firstOffset() + 1);
             }
 
@@ -1127,6 +1672,15 @@ public class SharePartition implements AutoCloseable {
 
     @Override
     public void close() {
+        lock.writeLock().lock();
+        try {
+            if (transactionalReconcileTask != null) {
+                transactionalReconcileTask.cancel();
+                transactionalReconcileTask = null;
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
         if (partitionState() == SharePartitionState.ACTIVE) {
             log.warn("Closing share partition: {}-{} while in active state. Consider marking it fenced "
                 + "before close.", groupId, topicIdPartition);
@@ -1361,6 +1915,11 @@ public class SharePartition implements AutoCloseable {
         }
     }
 
+    private boolean isTransactionalOffsetHeld(long offset) {
+        Map.Entry<Long, TransactionalReservation> held = transactionalReservations.floorEntry(offset);
+        return held != null && held.getValue().lastOffset >= offset;
+    }
+
     /**
      * The method calculates the number of Terminal records before the given offset. This method is called whenever LSO is
      * updated. Since that is a rare event, we can afford to do a linear scan of the cached state.
@@ -1381,7 +1940,7 @@ public class SharePartition implements AutoCloseable {
                 }
 
                 if (inFlightBatch.offsetState() == null) {
-                    if (isStateTerminal(inFlightBatch.batchState())) {
+                    if (isStateTerminal(inFlightBatch.batchState()) && !isTransactionalOffsetHeld(inFlightBatch.firstOffset())) {
                         // If the code reaches this point, this means that the current batch is Terminal and some of its
                         // records lie beyond startOffset. Now we need to find how many of its records lie in-flight (
                         // between startOffset and endOffset).
@@ -1397,7 +1956,8 @@ public class SharePartition implements AutoCloseable {
                     // startOffset and endOffset will be considered.
                     for (Map.Entry<Long, InFlightState> offsetEntry : inFlightBatch.offsetState().entrySet()) {
                         long offset = offsetEntry.getKey();
-                        if (offset >= startOffset && offset < newLSO && isStateTerminal(offsetEntry.getValue().state())) {
+                        if (offset >= startOffset && offset < newLSO && isStateTerminal(offsetEntry.getValue().state()) &&
+                            !isTransactionalOffsetHeld(offset)) {
                             count++;
                         }
                     }
@@ -1590,6 +2150,10 @@ public class SharePartition implements AutoCloseable {
         lock.writeLock().lock();
         try {
             partitionState = SharePartitionState.FENCED;
+            if (transactionalReconcileTask != null) {
+                transactionalReconcileTask.cancel();
+                transactionalReconcileTask = null;
+            }
         } finally {
             lock.writeLock().unlock();
         }
@@ -1903,6 +2467,8 @@ public class SharePartition implements AutoCloseable {
                         null,
                         timeoutHandler,
                         sharePartitionMetrics);
+                    acquiredRecords.setAcquisitionId(nextAcquisitionId());
+                    inFlightBatch.updateAcquisitionId(acquiredRecords.acquisitionId());
                     int delayMs = configProvider.recordLockDurationMsOrDefault(groupId, defaultRecordLockDurationMs);
                     long lastOffset = acquiredRecords.firstOffset() + maxFetchRecords - 1;
                     inFlightBatch.maybeInitializeOffsetStateUpdate(lastOffset, delayMs);
@@ -1932,6 +2498,7 @@ public class SharePartition implements AutoCloseable {
         lock.writeLock().lock();
         try {
             acquiredRecordsList.forEach(acquiredRecords -> {
+                acquiredRecords.setAcquisitionId(nextAcquisitionId());
                 AcquisitionLockTimerTask timerTask = scheduleAcquisitionLockTimeout(
                     memberId, acquiredRecords.firstOffset(), acquiredRecords.lastOffset());
 
@@ -1946,6 +2513,7 @@ public class SharePartition implements AutoCloseable {
                     timerTask,
                     timeoutHandler,
                     sharePartitionMetrics));
+                cachedState.get(acquiredRecords.firstOffset()).updateAcquisitionId(acquiredRecords.acquisitionId());
                 // Update the in-flight batch message count metrics for the share partition.
                 sharePartitionMetrics.recordInFlightBatchMessageCount(acquiredRecords.lastOffset() - acquiredRecords.firstOffset() + 1);
             });
@@ -1975,6 +2543,9 @@ public class SharePartition implements AutoCloseable {
         int maxDeliveryCount = maxDeliveryCount();
         int throttleRecordsDeliveryLimit = throttleRecordsDeliveryLimit(maxDeliveryCount);
         List<AcquiredRecords> offsetAcquiredRecords = new ArrayList<>();
+        Uuid subsetAcquisitionId = Uuid.ZERO_UUID;
+        long previousAcquiredOffset = -1;
+        int previousDeliveryCount = -1;
         lock.writeLock().lock();
         try {
             for (Map.Entry<Long, InFlightState> offsetState : inFlightBatch.offsetState().entrySet()) {
@@ -2034,6 +2605,12 @@ public class SharePartition implements AutoCloseable {
                         groupId, topicIdPartition);
                     continue;
                 }
+                if (offsetState.getKey() != previousAcquiredOffset + 1 || updateResult.deliveryCount() != previousDeliveryCount) {
+                    subsetAcquisitionId = nextAcquisitionId();
+                }
+                updateResult.updateAcquisitionId(subsetAcquisitionId);
+                previousAcquiredOffset = offsetState.getKey();
+                previousDeliveryCount = updateResult.deliveryCount();
                 // Schedule acquisition lock timeout for the offset.
                 AcquisitionLockTimerTask acquisitionLockTimeoutTask = scheduleAcquisitionLockTimeout(memberId, offsetState.getKey(), offsetState.getKey());
                 // Update acquisition lock timeout task for the offset.
@@ -2042,7 +2619,8 @@ public class SharePartition implements AutoCloseable {
                 offsetAcquiredRecords.add(new AcquiredRecords()
                     .setFirstOffset(offsetState.getKey())
                     .setLastOffset(offsetState.getKey())
-                    .setDeliveryCount((short) offsetState.getValue().deliveryCount()));
+                    .setDeliveryCount((short) offsetState.getValue().deliveryCount())
+                    .setAcquisitionId(updateResult.acquisitionId()));
                 acquiredCount++;
 
                 // Delivered alone.
@@ -2840,6 +3418,9 @@ public class SharePartition implements AutoCloseable {
 
     // Visible for testing
     CompletableFuture<Void> writeShareGroupState(List<PersisterStateBatch> stateBatches) {
+        if (!writerGeneration.equals(Uuid.ZERO_UUID)) {
+            return persister.writeFencedState(sharePartitionKey(), fencedWriteData(stateBatches), null, -1L, (short) -1);
+        }
         CompletableFuture<Void> future = new CompletableFuture<>();
         persister.writeState(new WriteShareGroupStateParameters.Builder()
             .setGroupTopicPartitionData(new GroupTopicPartitionData.Builder<PartitionStateBatchData>()
@@ -3217,6 +3798,7 @@ public class SharePartition implements AutoCloseable {
             long unresolvedFirstOffset = unresolvedAcquiredRecords.firstOffset();
             long unresolvedLastOffset = unresolvedAcquiredRecords.lastOffset();
             short unresolvedDeliveryCount = unresolvedAcquiredRecords.deliveryCount();
+            Uuid unresolvedAcquisitionId = unresolvedAcquiredRecords.acquisitionId();
 
             if (batchToArchive == null) {
                 result.add(unresolvedAcquiredRecords);
@@ -3242,7 +3824,8 @@ public class SharePartition implements AutoCloseable {
                     result.add(new AcquiredRecords()
                         .setFirstOffset(unresolvedFirstOffset)
                         .setLastOffset(batchToArchive.baseOffset() - 1)
-                        .setDeliveryCount(unresolvedDeliveryCount));
+                        .setDeliveryCount(unresolvedDeliveryCount)
+                        .setAcquisitionId(unresolvedAcquisitionId));
                 }
                 if (unresolvedLastOffset > batchToArchive.lastOffset()) {
                     // The offsets in unresolvedAcquiredRecords that are present after batchToArchive's lastOffset should not get filtered out
@@ -3250,7 +3833,8 @@ public class SharePartition implements AutoCloseable {
                     unresolvedAcquiredRecords = new AcquiredRecords()
                         .setFirstOffset(batchToArchive.lastOffset() + 1)
                         .setLastOffset(unresolvedLastOffset)
-                        .setDeliveryCount(unresolvedDeliveryCount);
+                        .setDeliveryCount(unresolvedDeliveryCount)
+                        .setAcquisitionId(unresolvedAcquisitionId);
                 }
             }
 
@@ -3553,6 +4137,37 @@ public class SharePartition implements AutoCloseable {
 
         void gapStartOffset(long gapStartOffset) {
             this.gapStartOffset = gapStartOffset;
+        }
+    }
+
+    private record TransactionalOwner(String transactionalId, long producerId, short producerEpoch) { }
+
+    private record TransactionalCandidate(long firstOffset, long lastOffset, InFlightBatch batch,
+                                          InFlightState state, Uuid acquisitionId, RecordState target) { }
+
+    private record RestoredTransactionalRange(long firstOffset, long lastOffset, RecordState state,
+                                               short deliveryCount, TransactionalOwner owner) { }
+
+    private static final class TransactionalReservation {
+        private final long firstOffset;
+        private final long lastOffset;
+        private final TransactionalOwner owner;
+        private final Uuid acquisitionId;
+        private final RecordState target;
+        private final InFlightState state;
+        private final CompletableFuture<Void> persistence;
+        private boolean durable;
+
+        private TransactionalReservation(long firstOffset, long lastOffset, TransactionalOwner owner, Uuid acquisitionId,
+                                         RecordState target, InFlightState state, CompletableFuture<Void> persistence, boolean durable) {
+            this.firstOffset = firstOffset;
+            this.lastOffset = lastOffset;
+            this.owner = owner;
+            this.acquisitionId = acquisitionId;
+            this.target = target;
+            this.state = state;
+            this.persistence = persistence;
+            this.durable = durable;
         }
     }
 

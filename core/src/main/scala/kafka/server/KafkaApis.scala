@@ -243,6 +243,8 @@ class KafkaApis(val requestChannel: RequestChannel,
         case ApiKeys.SHARE_GROUP_DESCRIBE => handleShareGroupDescribe(request).exceptionally(handleError)
         case ApiKeys.SHARE_FETCH => handleShareFetchRequest(request).exceptionally(handleError)
         case ApiKeys.SHARE_ACKNOWLEDGE => handleShareAcknowledgeRequest(request).exceptionally(handleError)
+        case ApiKeys.TXN_SHARE_ACKNOWLEDGE => handleTxnShareAcknowledgeRequest(request).exceptionally(handleError)
+        case ApiKeys.TXN_COMPLETE => handleTxnCompleteRequest(request)
         case ApiKeys.INITIALIZE_SHARE_GROUP_STATE => handleInitializeShareGroupStateRequest(request).exceptionally(handleError)
         case ApiKeys.READ_SHARE_GROUP_STATE => handleReadShareGroupStateRequest(request).exceptionally(handleError)
         case ApiKeys.WRITE_SHARE_GROUP_STATE => handleWriteShareGroupStateRequest(request).exceptionally(handleError)
@@ -1838,15 +1840,15 @@ class KafkaApis(val requestChannel: RequestChannel,
         val markerTransactionVersion = marker.transactionVersion
 
         partitionsWithCompatibleMessageFormat.foreach { partition =>
-          if (partition.topic == GROUP_METADATA_TOPIC_NAME) {
-            groupCoordinator.completeTransaction(
-              partition,
-              marker.producerId,
-              marker.producerEpoch,
-              marker.coordinatorEpoch,
-              marker.transactionResult,
-              markerTransactionVersion
-            ).whenComplete { (_, exception) =>
+          if (partition.topic == GROUP_METADATA_TOPIC_NAME || partition.topic == SHARE_GROUP_STATE_TOPIC_NAME) {
+            val completion = if (partition.topic == GROUP_METADATA_TOPIC_NAME) {
+              groupCoordinator.completeTransaction(partition, marker.producerId, marker.producerEpoch,
+                marker.coordinatorEpoch, marker.transactionResult, markerTransactionVersion)
+            } else {
+              shareCoordinator.completeTransaction(partition, marker.producerId, marker.producerEpoch,
+                marker.coordinatorEpoch, marker.transactionResult, markerTransactionVersion)
+            }
+            completion.whenComplete { (_, exception) =>
               val error = if (exception == null) {
                 Errors.NONE
               } else {
@@ -3282,7 +3284,7 @@ class KafkaApis(val requestChannel: RequestChannel,
   def handleShareFetchRequest(request: Request): CompletableFuture[Unit] = {
     val shareFetchRequest = request.body(classOf[ShareFetchRequest])
 
-    if (!isShareGroupProtocolEnabled) {
+    if (!isShareGroupProtocolEnabled || (shareFetchRequest.version >= 3 && !shareVersion().supportsTransactionalAcknowledgements)) {
       requestHelper.sendMaybeThrottle(request, shareFetchRequest.getErrorResponse(AbstractResponse.DEFAULT_THROTTLE_TIME, Errors.UNSUPPORTED_VERSION.exception))
       return CompletableFuture.completedFuture[Unit](())
     }
@@ -3415,7 +3417,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         authorizedTopics,
         groupId,
         memberId,
-        shareFetchRequest.version == 2,
+        shareFetchRequest.version >= 2,
         shareFetchRequest.data.isRenewAck
       )
     }
@@ -3748,6 +3750,91 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
   }
 
+  def handleTxnShareAcknowledgeRequest(request: Request): CompletableFuture[Unit] = {
+    val txnRequest = request.body(classOf[TxnShareAcknowledgeRequest])
+    val data = txnRequest.data
+
+    def respondWithError(error: Throwable): CompletableFuture[Unit] = {
+      requestHelper.sendMaybeThrottle(request, txnRequest.getErrorResponse(AbstractResponse.DEFAULT_THROTTLE_TIME, error))
+      CompletableFuture.completedFuture[Unit](())
+    }
+
+    if (!shareVersion().supportsTransactionalAcknowledgements) {
+      return respondWithError(Errors.UNSUPPORTED_VERSION.exception)
+    }
+    if (data.groupId == null || data.groupId.isEmpty || data.transactionalId == null || data.transactionalId.isEmpty ||
+      data.producerId < 0 || data.producerEpoch < 0 || data.producerEpoch == Short.MaxValue ||
+      !isMemberIdValid(data.memberId) || data.shareSessionEpoch <= 0 || data.topics.isEmpty) {
+      return respondWithError(Errors.INVALID_REQUEST.exception)
+    }
+    if (!authHelper.authorize(request.context, READ, GROUP, data.groupId)) {
+      return respondWithError(Errors.GROUP_AUTHORIZATION_FAILED.exception)
+    }
+    if (!authHelper.authorize(request.context, WRITE, TRANSACTIONAL_ID, data.transactionalId)) {
+      return respondWithError(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.exception)
+    }
+
+    val keys = mutable.Set.empty[(Uuid, Int)]
+    if (data.topics.asScala.exists(topic => topic.partitions.isEmpty || topic.partitions.asScala.exists { partition =>
+      partition.partitionIndex < 0 || partition.acknowledgementBatches.isEmpty ||
+        !keys.add((topic.topicId, partition.partitionIndex))
+    })) {
+      return respondWithError(Errors.INVALID_REQUEST.exception)
+    }
+
+    try {
+      sharePartitionManager.acknowledgeSessionUpdate(data.groupId, data.memberId, data.shareSessionEpoch)
+    } catch {
+      case e: Exception => return respondWithError(e)
+    }
+
+    val topicNames = metadataCache.topicIdsToNames()
+    val responses = data.topics.asScala.map { topic =>
+      val topicName = topicNames.get(topic.topicId)
+      val topicError = if (topicName == null) Errors.UNKNOWN_TOPIC_ID
+      else if (!authHelper.authorize(request.context, READ, TOPIC, topicName)) Errors.TOPIC_AUTHORIZATION_FAILED
+      else Errors.NONE
+      val results = topic.partitions.asScala.map { partition =>
+        val staged = if (topicError == Errors.NONE) {
+          val source = new TopicIdPartition(topic.topicId, new TopicPartition(topicName, partition.partitionIndex))
+          sharePartitionManager.acknowledgeTransactional(data.groupId, data.memberId, source,
+            data.transactionalId, data.producerId, data.producerEpoch, partition.acknowledgementBatches)
+        } else {
+          CompletableFuture.failedFuture[Void](topicError.exception)
+        }
+        staged.handle[TxnShareAcknowledgeResponseData.TxnShareAcknowledgePartitionResponse] { (_, failure) =>
+          val error = if (failure == null) Errors.NONE else Errors.forException(failure)
+          new TxnShareAcknowledgeResponseData.TxnShareAcknowledgePartitionResponse()
+            .setPartitionIndex(partition.partitionIndex).setErrorCode(error.code)
+        }
+      }
+      CompletableFuture.allOf(results.toArray: _*).thenApply[TxnShareAcknowledgeResponseData.TxnShareAcknowledgeTopicResponse] { _ =>
+        new TxnShareAcknowledgeResponseData.TxnShareAcknowledgeTopicResponse()
+          .setTopicId(topic.topicId).setPartitions(results.iterator.map(_.join()).toList.asJava)
+      }
+    }
+    CompletableFuture.allOf(responses.toArray: _*).thenApply[Unit] { _ =>
+      val response = new TxnShareAcknowledgeResponseData()
+      response.responses.addAll(responses.iterator.map(_.join()).toList.asJava)
+      requestHelper.sendMaybeThrottle(request, new TxnShareAcknowledgeResponse(response))
+    }
+  }
+
+  def handleTxnCompleteRequest(request: Request): Unit = {
+    val complete = request.body(classOf[TxnCompleteRequest])
+    if (!authorizeClusterOperation(request, CLUSTER_ACTION)) {
+      requestHelper.sendResponseExemptThrottle(request,
+        complete.getErrorResponse(AbstractResponse.DEFAULT_THROTTLE_TIME, Errors.CLUSTER_AUTHORIZATION_FAILED.exception))
+    } else {
+      sharePartitionManager.reconcileTransactionalAcknowledgements()
+      val response = new TxnCompleteResponseData().setTransactions(complete.data.transactions.asScala.map { transaction =>
+        new TxnCompleteResponseData.TxnCompleteTransactionResponse()
+          .setProducerId(transaction.producerId).setProducerEpoch(transaction.producerEpoch)
+      }.asJava)
+      requestHelper.sendResponseExemptThrottle(request, new TxnCompleteResponse(response))
+    }
+  }
+
   def handleInitializeShareGroupStateRequest(request: Request): CompletableFuture[Unit] = {
     val initializeShareGroupStateRequest = request.body(classOf[InitializeShareGroupStateRequest])
     // We do not need a check for isShareGroupProtocolEnabled in this RPC since there is a check for it in ShareFetch/ShareAcknowledge RPCs,
@@ -3807,6 +3894,11 @@ class KafkaApis(val requestChannel: RequestChannel,
           writeShareGroupStateRequest.data(),
           Errors.CLUSTER_AUTHORIZATION_FAILED
         )))
+      return CompletableFuture.completedFuture[Unit](())
+    }
+
+    if (writeShareGroupStateRequest.data.transactionalId != null && !shareVersion().supportsTransactionalAcknowledgements) {
+      requestHelper.sendMaybeThrottle(request, writeShareGroupStateRequest.getErrorResponse(Errors.UNSUPPORTED_VERSION.exception))
       return CompletableFuture.completedFuture[Unit](())
     }
 
